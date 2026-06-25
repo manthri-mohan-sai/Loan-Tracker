@@ -66,7 +66,7 @@ enum NudgeEngine {
 
     // MARK: - Individual generators
 
-    /// Pay ₹X extra/mo on the loan with the highest interest-rate leverage
+    /// Pay extra/mo on the loan with the highest interest-rate leverage
     /// (remaining balance × annual rate). That's the loan where extra payments
     /// save the most interest.
     private static func prepaymentImpactNudges(_ loans: [Loan]) -> [Nudge] {
@@ -74,8 +74,9 @@ enum NudgeEngine {
             $0.remainingBalance * $0.annualInterestRate < $1.remainingBalance * $1.annualInterestRate
         }) else { return [] }
 
-        // Suggest ~15% of EMI as extra, rounded to nearest ₹500. Minimum ₹500.
-        let suggestedExtra = max(500, ((target.monthlyPayment * 0.15) / 500).rounded() * 500)
+        // Suggest ~15% of EMI as extra, rounded to a sensible increment.
+        let roundUnit = roundingUnit(for: target.currencyCode, emi: target.monthlyPayment)
+        let suggestedExtra = max(roundUnit, ((target.monthlyPayment * 0.15) / roundUnit).rounded() * roundUnit)
 
         guard let baseline = target.projection(extraLumpSum: 0, extraMonthly: 0),
               let scenario = target.projection(extraLumpSum: 0, extraMonthly: suggestedExtra) else {
@@ -85,16 +86,17 @@ enum NudgeEngine {
         let interestSaved = baseline.interestRemaining - scenario.interestRemaining
         let monthsSaved = Int(ceil(baseline.monthsRemaining - scenario.monthsRemaining))
 
-        // Only show if it actually saves something meaningful (₹1000+ and 1+ month).
-        guard interestSaved > 1000, monthsSaved >= 1 else { return [] }
+        // Only show if it actually saves something meaningful.
+        guard interestSaved > roundUnit * 2, monthsSaved >= 1 else { return [] }
 
+        let cc = target.currencyCode
         return [Nudge(
             id: "\(NudgeKind.prepaymentImpact.rawValue)-\(target.id.uuidString)",
             kind: .prepaymentImpact,
             title: "Save Interest",
             icon: "arrow.up.right.circle.fill",
             tint: .savings,
-            message: "Paying ₹\(inrCompact(suggestedExtra)) extra/mo on \(target.name) closes it \(monthsSaved) month\(monthsSaved == 1 ? "" : "s") sooner and saves ₹\(inrCompact(interestSaved)) in interest.",
+            message: "Paying \(currencyCompact(suggestedExtra, code: cc)) extra/mo on \(target.name) closes it \(monthsSaved) month\(monthsSaved == 1 ? "" : "s") sooner and saves \(currencyCompact(interestSaved, code: cc)) in interest.",
             actionLabel: "Try in Playground",
             loanID: target.id,
             score: scoreFromSavings(interestSaved)
@@ -105,9 +107,10 @@ enum NudgeEngine {
     private static func lumpSumImpactNudges(_ loans: [Loan]) -> [Nudge] {
         guard let target = loans.max(by: { $0.annualInterestRate < $1.annualInterestRate }) else { return [] }
 
-        // ~10% of remaining balance, rounded to ₹10K. Skip if it'd just close the loan.
+        // ~10% of remaining balance, rounded to a sensible unit.
         let raw = target.remainingBalance * 0.10
-        let suggestedLump = max(10_000, (raw / 10_000).rounded() * 10_000)
+        let lumpUnit = roundingUnit(for: target.currencyCode, emi: target.monthlyPayment) * 20
+        let suggestedLump = max(lumpUnit, (raw / lumpUnit).rounded() * lumpUnit)
         guard suggestedLump < target.remainingBalance * 0.5 else { return [] }
 
         guard let baseline = target.projection(extraLumpSum: 0, extraMonthly: 0),
@@ -118,15 +121,16 @@ enum NudgeEngine {
         let interestSaved = baseline.interestRemaining - scenario.interestRemaining
         let monthsSaved = Int(ceil(baseline.monthsRemaining - scenario.monthsRemaining))
 
-        guard interestSaved > 5000 else { return [] }
+        guard interestSaved > lumpUnit else { return [] }
 
+        let cc = target.currencyCode
         return [Nudge(
             id: "\(NudgeKind.lumpSumImpact.rawValue)-\(target.id.uuidString)",
             kind: .lumpSumImpact,
             title: "Lump Sum Opportunity",
             icon: "bolt.circle.fill",
             tint: .savings,
-            message: "A one-time ₹\(inrCompact(suggestedLump)) prepayment on \(target.name) saves ₹\(inrCompact(interestSaved)) in interest and closes it \(monthsSaved) month\(monthsSaved == 1 ? "" : "s") sooner.",
+            message: "A one-time \(currencyCompact(suggestedLump, code: cc)) prepayment on \(target.name) saves \(currencyCompact(interestSaved, code: cc)) in interest and closes it \(monthsSaved) month\(monthsSaved == 1 ? "" : "s") sooner.",
             actionLabel: "Explore",
             loanID: target.id,
             score: scoreFromSavings(interestSaved)
@@ -174,7 +178,7 @@ enum NudgeEngine {
             title: "Almost there",
             icon: "flag.checkered",
             tint: .milestone,
-            message: "\(target.loan.name) closes in \(target.months) month\(target.months == 1 ? "" : "s"). You'll free up ₹\(inrCompact(target.loan.monthlyPayment))/mo after that.",
+            message: "\(target.loan.name) closes in \(target.months) month\(target.months == 1 ? "" : "s"). You'll free up \(currencyCompact(target.loan.monthlyPayment, code: target.loan.currencyCode))/mo after that.",
             actionLabel: nil,
             loanID: target.loan.id,
             score: 25 - target.months   // sooner = higher score
@@ -216,21 +220,31 @@ enum NudgeEngine {
 
     // MARK: - Scoring & formatting
 
-    /// Convert interest savings (₹) to a score. Logarithmic-ish so a ₹5K save
-    /// and a ₹50K save don't differ by 10x — they differ by ~2x.
-    private static func scoreFromSavings(_ rupees: Double) -> Int {
-        50 + Int(log10(max(1, rupees / 100)) * 15)
+    /// Convert interest savings to a score. Logarithmic-ish so a 5K save
+    /// and a 50K save don't differ by 10x — they differ by ~2x.
+    private static func scoreFromSavings(_ amount: Double) -> Int {
+        50 + Int(log10(max(1, amount / 100)) * 15)
     }
 
-    /// Indian-style compact INR: 12,345 → "12,345"; 1,23,456 → "1,23,456".
-    private static func inrCompact(_ value: Double) -> String {
-        let formatter = NumberFormatter()
-        formatter.numberStyle = .decimal
-        formatter.groupingSize = 3
-        formatter.secondaryGroupingSize = 2
-        formatter.usesGroupingSeparator = true
-        formatter.maximumFractionDigits = 0
-        return formatter.string(from: NSNumber(value: Int(value))) ?? "\(Int(value))"
+    /// Format an amount with the loan's currency symbol, compact and rounded.
+    private static func currencyCompact(_ value: Double, code: String) -> String {
+        let formatted = value.formatted(.currency(code: code).precision(.fractionLength(0)))
+        return formatted
+    }
+
+    /// Sensible rounding unit for suggested amounts based on currency.
+    /// For high-denomination currencies (INR, JPY, KRW) use larger steps;
+    /// for USD/EUR/GBP use smaller steps.
+    private static func roundingUnit(for code: String, emi: Double) -> Double {
+        switch code {
+        case "JPY", "KRW", "VND", "IDR":
+            return max(1000, (emi * 0.01).rounded(.up))
+        case "INR":
+            return 500
+        default:
+            // USD, EUR, GBP, AUD, CAD, etc.
+            return max(50, ((emi * 0.05) / 50).rounded() * 50)
+        }
     }
 
     // MARK: - Dismissal tracking

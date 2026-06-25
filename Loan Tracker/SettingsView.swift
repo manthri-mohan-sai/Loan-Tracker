@@ -2,9 +2,11 @@ import SwiftUI
 import SwiftData
 import UserNotifications
 import UIKit
+import LocalAuthentication
 
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var context
     @Query(sort: \Loan.createdAt) private var loans: [Loan]
 
     // Bound to UserDefaults via @AppStorage so changes persist.
@@ -19,12 +21,18 @@ struct SettingsView: View {
     @State private var authStatus: UNAuthorizationStatus = .notDetermined
     @State private var showingExportSheet = false
     @State private var showingImportSheet = false
+    @State private var showingCSVExport = false
     @State private var showingPermissionAlert = false
+    @State private var biometricManager = BiometricLockManager.shared
+    @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = true
+    @AppStorage("defaultCurrency") private var defaultCurrency: String = Locale.current.currency?.identifier ?? "USD"
 
     var body: some View {
         NavigationStack {
             Form {
                 notificationsSection
+                currencySection
+                securitySection
                 dataSection
                 aboutSection
             }
@@ -41,6 +49,9 @@ struct SettingsView: View {
             .sheet(isPresented: $showingImportSheet) {
                 ImportBackupSheet()
             }
+            .sheet(isPresented: $showingCSVExport) {
+                CSVExportSheet(loans: loans)
+            }
             .alert("Notifications Disabled", isPresented: $showingPermissionAlert) {
                 Button("Open Settings") {
                     if let url = URL(string: UIApplication.openSettingsURLString) {
@@ -53,6 +64,7 @@ struct SettingsView: View {
             }
             .task {
                 authStatus = await NotificationManager.authorizationStatus()
+                biometricManager.checkBiometrics()
             }
         }
     }
@@ -130,6 +142,77 @@ struct SettingsView: View {
         }
     }
 
+    @State private var showCurrencyApplied = false
+
+    /// How many existing loans use a different currency than the default.
+    private var loansMismatchingCurrency: Int {
+        loans.filter { $0.currencyCode != defaultCurrency }.count
+    }
+
+    @ViewBuilder
+    private var currencySection: some View {
+        Section {
+            Picker("Default Currency", selection: $defaultCurrency) {
+                ForEach(SupportedCurrency.allCases) { currency in
+                    Text(currency.label).tag(currency.rawValue)
+                }
+            }
+
+            if loansMismatchingCurrency > 0 {
+                Button {
+                    for loan in loans {
+                        loan.currencyCode = defaultCurrency
+                    }
+                    try? context.save()
+                    showCurrencyApplied = true
+                } label: {
+                    Label("Apply to all \(loans.count) loan\(loans.count == 1 ? "" : "s")", systemImage: "arrow.triangle.2.circlepath")
+                }
+            }
+
+            if showCurrencyApplied {
+                Text("Updated all loans to \(defaultCurrency)")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+            }
+        } header: {
+            Text("Currency")
+        } footer: {
+            if loansMismatchingCurrency > 0 {
+                Text("\(loansMismatchingCurrency) loan\(loansMismatchingCurrency == 1 ? " uses" : "s use") a different currency. Tap \"Apply to all\" to update them, or change currency individually per loan.")
+            } else {
+                Text("New loans will default to this currency. You can change it per loan.")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var securitySection: some View {
+        Section {
+            Toggle(isOn: Binding(
+                get: { biometricManager.isEnabled },
+                set: { newValue in
+                    biometricManager.isEnabled = newValue
+                    if newValue {
+                        // Verify biometrics work when enabling
+                        Task { await biometricManager.authenticate() }
+                    }
+                }
+            )) {
+                Label(biometricManager.biometricName, systemImage: biometricManager.biometricIcon)
+            }
+            .disabled(biometricManager.biometricType == .none)
+        } header: {
+            Text("Security")
+        } footer: {
+            if biometricManager.biometricType == .none {
+                Text("No biometric authentication is available on this device.")
+            } else {
+                Text("Require \(biometricManager.biometricName) to open the app.")
+            }
+        }
+    }
+
     @ViewBuilder
     private var dataSection: some View {
         Section("Data") {
@@ -142,6 +225,11 @@ struct SettingsView: View {
                 showingImportSheet = true
             } label: {
                 Label("Import Backup…", systemImage: "square.and.arrow.down")
+            }
+            Button {
+                showingCSVExport = true
+            } label: {
+                Label("Export to CSV…", systemImage: "tablecells")
             }
         }
     }
@@ -160,6 +248,11 @@ struct SettingsView: View {
                 Spacer()
                 Text("\(loans.count)")
                     .foregroundStyle(.secondary)
+            }
+            Button {
+                hasCompletedOnboarding = false
+            } label: {
+                Label("Replay Onboarding", systemImage: "arrow.counterclockwise")
             }
         }
     }

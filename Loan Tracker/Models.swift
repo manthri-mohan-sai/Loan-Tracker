@@ -29,8 +29,33 @@ final class Loan {
     /// Only one loan can be pinned at a time; pinned loans float to the top.
     var isPinned: Bool = false
 
+    /// ISO 4217 currency code for this loan (e.g. "INR", "USD", "EUR", "GBP").
+    /// Each loan carries its own currency so users with loans in multiple
+    /// countries can track them side by side.
+    var currencyCode: String = "USD"
+
+    /// Whether the interest rate is floating (linked to a benchmark like
+    /// repo rate, SOFR, EURIBOR) or fixed for the full tenure.
+    /// Floating-rate loans should prompt the user to update when benchmarks change.
+    var isFloatingRate: Bool = false
+
+    /// Prepayment/foreclosure penalty as a percentage of the prepaid amount.
+    /// 0 for floating-rate home loans in India (RBI directive, 2012).
+    /// Typically 2-5% for personal/car loans, varies globally.
+    var prepaymentPenaltyPercent: Double = 0
+
+    /// Optional name of the lending bank/institution (e.g. "SBI", "Chase", "Barclays").
+    /// Used for display and to associate with bank templates.
+    var bankName: String = ""
+
     @Relationship(deleteRule: .cascade, inverse: \Payment.loan)
     var payments: [Payment] = []
+
+    @Relationship(deleteRule: .cascade, inverse: \RateChange.loan)
+    var rateChanges: [RateChange] = []
+
+    @Relationship(deleteRule: .cascade, inverse: \StoredDocument.loan)
+    var storedDocuments: [StoredDocument]? = []
 
     var totalLifetimeInterest: Double {
         let totalOutflow = monthlyPayment * Double(tenureMonths)
@@ -49,7 +74,11 @@ final class Loan {
          emiDay: Int,
          firstEMIDate: Date? = nil,
          iconKey: String = "generic",
-         isPinned: Bool = false) {
+         isPinned: Bool = false,
+         currencyCode: String = Locale.current.currency?.identifier ?? "USD",
+         isFloatingRate: Bool = false,
+         prepaymentPenaltyPercent: Double = 0,
+         bankName: String = "") {
         self.name = name
         self.principal = principal
         self.annualInterestRate = annualInterestRate
@@ -63,7 +92,27 @@ final class Loan {
         self.firstEMIDate = firstEMIDate
         self.iconKey = iconKey
         self.isPinned = isPinned
+        self.currencyCode = currencyCode
+        self.isFloatingRate = isFloatingRate
+        self.prepaymentPenaltyPercent = prepaymentPenaltyPercent
+        self.bankName = bankName
         self.createdAt = .now
+    }
+}
+
+/// Distinguishes regular EMI payments from one-time prepayments.
+/// Stored as a raw String on Payment for CloudKit/SwiftData safety.
+enum PaymentType: String, CaseIterable, Identifiable {
+    case emi = "emi"
+    case prepayment = "prepayment"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .emi: return "EMI"
+        case .prepayment: return "Prepayment"
+        }
     }
 }
 
@@ -72,12 +121,66 @@ final class Payment {
     var amount: Double = 0
     var date: Date = Date()
     var note: String?
+    /// "emi" or "prepayment" — see PaymentType enum.
+    var type: String = PaymentType.emi.rawValue
     var loan: Loan?
 
-    init(amount: Double, date: Date = .now, note: String? = nil) {
+    var paymentType: PaymentType {
+        PaymentType(rawValue: type) ?? .emi
+    }
+
+    init(amount: Double, date: Date = .now, note: String? = nil, type: PaymentType = .emi) {
         self.amount = amount
         self.date = date
         self.note = note
+        self.type = type.rawValue
+    }
+}
+
+/// Tracks historical interest rate changes on floating-rate loans.
+/// Each entry records when the bank revised the rate and the new value.
+@Model
+final class RateChange {
+    var effectiveDate: Date = Date()
+    var newAnnualRate: Double = 0  // e.g. 0.085 for 8.5%
+    var note: String?              // e.g. "RBI repo rate cut", "Fed rate hike"
+    var loan: Loan?
+
+    init(effectiveDate: Date, newAnnualRate: Double, note: String? = nil) {
+        self.effectiveDate = effectiveDate
+        self.newAnnualRate = newAnnualRate
+        self.note = note
+    }
+}
+
+@Model
+final class StoredDocument {
+    var id: UUID = UUID()
+    var fileName: String = ""
+    var fileType: String = ""        // "pdf", "image"
+    var addedDate: Date = Date()
+    var documentType: String = ""    // LoanDocumentType raw value
+    var note: String?
+
+    /// Relative path within the app's documents directory.
+    /// Actual file stored at: Documents/LoanDocuments/{id}.{ext}
+    var relativePath: String = ""
+
+    var loan: Loan?
+
+    init(fileName: String, fileType: String, documentType: String, note: String? = nil) {
+        self.fileName = fileName
+        self.fileType = fileType
+        self.documentType = documentType
+        self.note = note
+        let ext = fileType == "pdf" ? "pdf" : "jpg"
+        self.relativePath = "\(id.uuidString).\(ext)"
+    }
+
+    /// Full URL to the stored file.
+    var fileURL: URL? {
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return nil }
+        return docs.appendingPathComponent("LoanDocuments").appendingPathComponent(relativePath)
     }
 }
 
@@ -89,6 +192,109 @@ struct PrepaymentProjection {
     let totalCashRemaining: Double
     let closeDate: Date
     let isPaidOff: Bool
+}
+
+/// A single row in the amortization schedule.
+struct AmortizationRow: Identifiable {
+    let id: Int            // month index (0-based from today)
+    let date: Date
+    let emiAmount: Double
+    let principalComponent: Double
+    let interestComponent: Double
+    let closingBalance: Double
+}
+
+/// Strategy choice after making a prepayment.
+enum PrepaymentStrategy: String, CaseIterable, Identifiable {
+    case reduceTenure = "Reduce Tenure"
+    case reduceEMI = "Reduce EMI"
+
+    var id: String { rawValue }
+
+    var description: String {
+        switch self {
+        case .reduceTenure: return "Keep EMI same, close loan sooner"
+        case .reduceEMI: return "Keep tenure same, lower monthly payment"
+        }
+    }
+}
+
+// MARK: - Currency Helpers
+
+/// Common currencies with display metadata. Used by the loan form picker.
+enum SupportedCurrency: String, CaseIterable, Identifiable {
+    case inr = "INR"
+    case usd = "USD"
+    case eur = "EUR"
+    case gbp = "GBP"
+    case aed = "AED"
+    case sgd = "SGD"
+    case aud = "AUD"
+    case cad = "CAD"
+    case jpy = "JPY"
+    case myr = "MYR"
+    case thb = "THB"
+    case chf = "CHF"
+    case zar = "ZAR"
+    case brl = "BRL"
+    case mxn = "MXN"
+    case ngn = "NGN"
+    case kes = "KES"
+    case php = "PHP"
+    case idr = "IDR"
+    case vnd = "VND"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .inr: return "₹ Indian Rupee"
+        case .usd: return "$ US Dollar"
+        case .eur: return "€ Euro"
+        case .gbp: return "£ British Pound"
+        case .aed: return "د.إ UAE Dirham"
+        case .sgd: return "S$ Singapore Dollar"
+        case .aud: return "A$ Australian Dollar"
+        case .cad: return "C$ Canadian Dollar"
+        case .jpy: return "¥ Japanese Yen"
+        case .myr: return "RM Malaysian Ringgit"
+        case .thb: return "฿ Thai Baht"
+        case .chf: return "CHF Swiss Franc"
+        case .zar: return "R South African Rand"
+        case .brl: return "R$ Brazilian Real"
+        case .mxn: return "$ Mexican Peso"
+        case .ngn: return "₦ Nigerian Naira"
+        case .kes: return "KSh Kenyan Shilling"
+        case .php: return "₱ Philippine Peso"
+        case .idr: return "Rp Indonesian Rupiah"
+        case .vnd: return "₫ Vietnamese Dong"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .inr: return "₹"
+        case .usd: return "$"
+        case .eur: return "€"
+        case .gbp: return "£"
+        case .aed: return "د.إ"
+        case .sgd: return "S$"
+        case .aud: return "A$"
+        case .cad: return "C$"
+        case .jpy: return "¥"
+        case .myr: return "RM"
+        case .thb: return "฿"
+        case .chf: return "CHF"
+        case .zar: return "R"
+        case .brl: return "R$"
+        case .mxn: return "$"
+        case .ngn: return "₦"
+        case .kes: return "KSh"
+        case .php: return "₱"
+        case .idr: return "Rp"
+        case .vnd: return "₫"
+        }
+    }
 }
 
 // MARK: - Amortization Math
@@ -187,12 +393,32 @@ extension Loan {
             cursor = Calendar.current.date(byAdding: .month, value: elapsedInt, to: startDate) ?? startDate
         }
 
-        // Apply tracked payments on top of either starting point, accruing interest between them.
-        let sorted = payments.sorted { $0.date < $1.date }
-        for p in sorted {
-            let monthsDelta = max(0, Self.monthsBetween(cursor, p.date))
-            balance = balance * pow(1 + r, monthsDelta) - p.amount
-            cursor = max(cursor, p.date)
+        // Build a merged timeline of payments and rate changes, then walk forward
+        // accruing interest at the applicable rate between each event.
+        struct TimelineEvent: Comparable {
+            let date: Date
+            let payment: Double       // 0 if this is a rate-change-only event
+            let newMonthlyRate: Double? // non-nil if this event changes the rate
+            static func < (lhs: TimelineEvent, rhs: TimelineEvent) -> Bool { lhs.date < rhs.date }
+        }
+
+        var events: [TimelineEvent] = payments.map {
+            TimelineEvent(date: $0.date, payment: $0.amount, newMonthlyRate: nil)
+        }
+        for rc in rateChanges {
+            events.append(TimelineEvent(date: rc.effectiveDate, payment: 0, newMonthlyRate: rc.newAnnualRate / 12.0))
+        }
+        events.sort()
+
+        var currentRate = r
+        for event in events {
+            let monthsDelta = max(0, Self.monthsBetween(cursor, event.date))
+            balance = balance * pow(1 + currentRate, monthsDelta)
+            if let newRate = event.newMonthlyRate {
+                currentRate = newRate
+            }
+            balance -= event.payment
+            cursor = max(cursor, event.date)
         }
 
         return max(0, balance)
@@ -373,6 +599,66 @@ extension Loan {
         return points
     }
 
+    // MARK: - Amortization Schedule
+
+    /// Month-by-month amortization schedule from the current balance forward.
+    /// Each row shows how the EMI splits into principal and interest components.
+    func amortizationSchedule(extraMonthly: Double = 0,
+                              extraLumpSum: Double = 0,
+                              maxMonths: Int = 600) -> [AmortizationRow] {
+        var balance = max(0, remainingBalance - max(0, extraLumpSum))
+        let M = monthlyPayment + max(0, extraMonthly)
+        let r = monthlyRate
+        let cal = Calendar.current
+        let anchor = nextEMIDate ?? Date()
+        var rows: [AmortizationRow] = []
+
+        guard M > 0 else { return rows }
+
+        var month = 0
+        while balance > 0.01 && month < maxMonths {
+            let interest = balance * r
+            let principalPortion = min(M - interest, balance)
+            if principalPortion <= 0 { break }
+            balance = max(0, balance - principalPortion)
+            let date = cal.date(byAdding: .month, value: month, to: anchor) ?? anchor
+            rows.append(AmortizationRow(
+                id: month,
+                date: date,
+                emiAmount: interest + principalPortion,
+                principalComponent: principalPortion,
+                interestComponent: interest,
+                closingBalance: balance
+            ))
+            month += 1
+        }
+        return rows
+    }
+
+    // MARK: - Prepayment Strategies
+
+    /// After a prepayment, banks offer two choices:
+    /// 1. Reduce tenure (keep same EMI) — the default in the existing playground
+    /// 2. Reduce EMI (keep same tenure) — useful for improving monthly cash flow
+    ///
+    /// This returns the new EMI if the user keeps the remaining tenure fixed.
+    func reducedEMI(afterPrepayment lumpSum: Double) -> Double? {
+        let newBalance = max(0, remainingBalance - max(0, lumpSum))
+        guard let months = estimatedMonthsRemaining, months > 0 else { return nil }
+        let r = monthlyRate
+        if r == 0 { return newBalance / Double(months) }
+        let factor = pow(1 + r, Double(months))
+        guard factor > 1 else { return nil }
+        return newBalance * r * factor / (factor - 1)
+    }
+
+    /// Net effective prepayment after deducting penalty charges.
+    /// penalty = lumpSum × prepaymentPenaltyPercent / 100
+    func effectivePrepayment(_ lumpSum: Double) -> Double {
+        let penalty = lumpSum * prepaymentPenaltyPercent / 100.0
+        return max(0, lumpSum - penalty)
+    }
+
     /// Originally agreed end date based on tenure.
     var scheduledEndDate: Date? {
         guard tenureMonths > 0 else { return nil }
@@ -407,8 +693,8 @@ extension Loan {
             return cal.date(from: dc)
         }
 
-        // Count tracked payments that count as a full EMI (>= half the EMI amount).
-        let trackedFullPayments = payments.filter { $0.amount >= monthlyPayment * 0.5 }.count
+        // Count tracked payments that are actual EMI payments (not lump-sum prepayments).
+        let trackedFullPayments = payments.filter { $0.paymentType == .emi }.count
 
         // Base count of EMIs paid before tracking. Mirrors `totalMonthsPaid`:
         // when the user provided `currentOutstanding`, we solve the amortization
@@ -460,11 +746,14 @@ extension Loan {
         }
     }
 
+    /// Only count EMI-type payments toward "months paid".
+    /// Lump-sum prepayments reduce principal but don't represent an EMI cycle.
     var totalMonthsPaid: Int {
         let baseMonths: Double = currentOutstanding > 0
             ? impliedMonthsPaid
             : Double(derivedElapsedMonths)
-        return Int(baseMonths.rounded()) + payments.count
+        let emiPayments = payments.filter { $0.paymentType == .emi }.count
+        return Int(baseMonths.rounded()) + emiPayments
     }
 
     /// How many EMIs *should* have been paid by today, based on the loan's
@@ -545,7 +834,7 @@ enum LoanIcon: String, CaseIterable, Identifiable {
     /// SF Symbol name used by SwiftUI's Image(systemName:).
     var systemImage: String {
         switch self {
-        case .generic:   return "indianrupeesign.circle.fill"
+        case .generic:   return "banknote.fill"
         case .home:      return "house.fill"
         case .car:       return "car.fill"
         case .bike:      return "bicycle"

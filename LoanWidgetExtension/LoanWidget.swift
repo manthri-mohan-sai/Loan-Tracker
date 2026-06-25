@@ -23,6 +23,7 @@ struct LoanSnapshot: Identifiable, Hashable {
     let iconKey: String              // SF Symbol-backed key for the loan icon
     let isPinned: Bool
     let missedEMIs: Int              // 0 = on track; >0 = behind schedule
+    let currencyCode: String         // ISO 4217 — "INR", "USD", "EUR", etc.
 }
 
 private let appGroupID = "group.com.app.simple-loan-tracker"
@@ -110,7 +111,7 @@ struct SelectLoanIntent: WidgetConfigurationIntent {
 /// Load all loans from the shared SwiftData store and convert to snapshots.
 /// Each widget provider calls this when computing its timeline.
 private func loadLoanSnapshots() -> [LoanSnapshot] {
-    let schema = Schema([Loan.self, Payment.self])
+    let schema = Schema([Loan.self, Payment.self, RateChange.self])
     let config = ModelConfiguration(
         "LoanTracker",
         schema: schema,
@@ -122,10 +123,6 @@ private func loadLoanSnapshots() -> [LoanSnapshot] {
         let context = ModelContext(container)
         let descriptor = FetchDescriptor<Loan>(sortBy: [SortDescriptor(\.createdAt)])
         let loans = try context.fetch(descriptor)
-        print("🔍 [Widget] Fetched \(loans.count) loans from App Group '\(appGroupID)'")
-        for loan in loans {
-            print("   - \(loan.name): remaining ₹\(loan.remainingBalance)")
-        }
 
         return loans.map { loan in
             LoanSnapshot(
@@ -142,7 +139,8 @@ private func loadLoanSnapshots() -> [LoanSnapshot] {
                 daysUntilNextEMI: loan.daysUntilNextEMI,
                 iconKey: loan.iconKey,
                 isPinned: loan.isPinned,
-                missedEMIs: loan.missedEMIs ?? 0
+                missedEMIs: loan.missedEMIs ?? 0,
+                currencyCode: loan.currencyCode
             )
         }
     } catch {
@@ -199,14 +197,21 @@ private func monthsToPayoff(balance: Double, monthlyPayment: Double, annualRate:
 /// and the app already calls refreshWidget() on writes — so 6 hours is comfortable.
 private let widgetRefreshInterval: TimeInterval = 6 * 60 * 60
 
-/// Total currency style used across all widgets — INR with no fractions and compact notation
-/// for the "₹19.5L" style that fits small widget tiles.
+/// Currency format helpers — use the loan's own currency code so amounts
+/// display correctly for any country (INR, USD, EUR, GBP, JPY, etc.).
 extension FormatStyle where Self == FloatingPointFormatStyle<Double>.Currency {
+    static func compact(code: String) -> FloatingPointFormatStyle<Double>.Currency {
+        .currency(code: code).precision(.fractionLength(0)).notation(.compactName)
+    }
+    static func full(code: String) -> FloatingPointFormatStyle<Double>.Currency {
+        .currency(code: code).precision(.fractionLength(0))
+    }
+    // Legacy convenience — used by overview widgets that aggregate across currencies
     static var inrCompact: FloatingPointFormatStyle<Double>.Currency {
-        .currency(code: "INR").precision(.fractionLength(0)).notation(.compactName)
+        .compact(code: "INR")
     }
     static var inrFull: FloatingPointFormatStyle<Double>.Currency {
-        .currency(code: "INR").precision(.fractionLength(0))
+        .full(code: "INR")
     }
 }
 
@@ -218,6 +223,8 @@ struct OverviewEntry: TimelineEntry {
     let monthlyEMITotal: Double
     let activeLoanCount: Int
     let debtFreeBy: Date?
+    /// Unified currency code when all active loans share the same currency; nil if mixed.
+    let currencyCode: String?
 }
 
 struct OverviewProvider: TimelineProvider {
@@ -227,7 +234,8 @@ struct OverviewProvider: TimelineProvider {
             totalRemaining: 2_724_962,
             monthlyEMITotal: 41_131,
             activeLoanCount: 3,
-            debtFreeBy: Calendar.current.date(byAdding: .month, value: 24, to: .now)
+            debtFreeBy: Calendar.current.date(byAdding: .month, value: 24, to: .now),
+            currencyCode: "INR"
         )
     }
 
@@ -244,12 +252,15 @@ struct OverviewProvider: TimelineProvider {
     private func load() -> OverviewEntry {
         let snaps = loadLoanSnapshots()
         let active = snaps.filter { $0.remaining > 0.01 }
+        let currencies = Set(active.map(\.currencyCode))
+        let unified = currencies.count == 1 ? currencies.first : nil
         return OverviewEntry(
             date: .now,
             totalRemaining: active.reduce(0) { $0 + $1.remaining },
             monthlyEMITotal: active.reduce(0) { $0 + $1.monthlyPayment },
             activeLoanCount: active.count,
-            debtFreeBy: debtFreeDate(from: snaps)
+            debtFreeBy: debtFreeDate(from: snaps),
+            currencyCode: unified
         )
     }
 }
@@ -257,6 +268,12 @@ struct OverviewProvider: TimelineProvider {
 struct OverviewWidgetView: View {
     let entry: OverviewEntry
     @Environment(\.widgetFamily) var family
+
+    /// Currency format for amounts — uses the unified currency if all loans
+    /// share the same one, otherwise falls back to INR.
+    private var compactFormat: FloatingPointFormatStyle<Double>.Currency {
+        .compact(code: entry.currencyCode ?? "INR")
+    }
 
     var body: some View {
         Group {
@@ -277,7 +294,7 @@ struct OverviewWidgetView: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
-            Text(entry.totalRemaining, format: .inrCompact)
+            Text(entry.totalRemaining, format: compactFormat)
                 .font(.system(size: 26, weight: .bold, design: .rounded))
                 .minimumScaleFactor(0.5)
                 .lineLimit(1)
@@ -288,7 +305,7 @@ struct OverviewWidgetView: View {
                         .foregroundStyle(.secondary)
                     Text("EMI/mo:")
                         .foregroundStyle(.secondary)
-                    Text(entry.monthlyEMITotal, format: .inrCompact)
+                    Text(entry.monthlyEMITotal, format: compactFormat)
                         .fontWeight(.semibold)
                         .monospacedDigit()
                 }
@@ -319,7 +336,7 @@ struct OverviewWidgetView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
-                Text(entry.totalRemaining, format: .inrCompact)
+                Text(entry.totalRemaining, format: compactFormat)
                     .font(.system(size: 32, weight: .bold, design: .rounded))
                     .minimumScaleFactor(0.5)
                     .lineLimit(1)
@@ -346,7 +363,7 @@ struct OverviewWidgetView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
 
-                    Text(entry.monthlyEMITotal, format: .inrCompact)
+                    Text(entry.monthlyEMITotal, format: compactFormat)
                         .font(.system(size: 24, weight: .bold, design: .rounded))
                         .minimumScaleFactor(0.5)
                         .lineLimit(1)
@@ -408,15 +425,15 @@ struct LoanListProvider: TimelineProvider {
             LoanSnapshot(id: "1", name: "Home Loan", remaining: 1_954_000, principal: 2_500_000,
                          progress: 0.22, monthsPaid: 12, tenureMonths: 240, monthlyPayment: 25_000,
                          annualInterestRate: 0.085, nextEMIDate: nil, daysUntilNextEMI: nil,
-                         iconKey: "home", isPinned: true, missedEMIs: 0),
+                         iconKey: "home", isPinned: true, missedEMIs: 0, currencyCode: "INR"),
             LoanSnapshot(id: "2", name: "Car Loan", remaining: 369_547, principal: 500_000,
                          progress: 0.26, monthsPaid: 9, tenureMonths: 36, monthlyPayment: 16_131,
                          annualInterestRate: 0.0999, nextEMIDate: nil, daysUntilNextEMI: nil,
-                         iconKey: "car", isPinned: false, missedEMIs: 0),
+                         iconKey: "car", isPinned: false, missedEMIs: 0, currencyCode: "INR"),
             LoanSnapshot(id: "3", name: "Personal", remaining: 401_415, principal: 500_000,
                          progress: 0.20, monthsPaid: 8, tenureMonths: 36, monthlyPayment: 16_131,
                          annualInterestRate: 0.0999, nextEMIDate: nil, daysUntilNextEMI: nil,
-                         iconKey: "person", isPinned: false, missedEMIs: 0)
+                         iconKey: "person", isPinned: false, missedEMIs: 0, currencyCode: "INR")
         ])
     }
 
@@ -508,7 +525,7 @@ private func widgetIconSymbol(_ key: String) -> String {
     case "medical":   return "cross.case.fill"
     case "gold":      return "circle.hexagongrid.fill"
     case "card":      return "creditcard.fill"
-    default:          return "indianrupeesign.circle.fill"
+    default:          return "banknote.fill"
     }
 }
 
@@ -547,7 +564,7 @@ private struct LoanRowView: View {
                             .clipShape(Capsule())
                     }
                     Spacer()
-                    Text(loan.remaining, format: .inrCompact)
+                    Text(loan.remaining, format: .compact(code: loan.currencyCode))
                         .font(.caption.weight(.semibold))
                         .monospacedDigit()
                 }
@@ -603,7 +620,7 @@ struct NextEMIProvider: TimelineProvider {
                 id: "1", name: "Personal Loan", remaining: 401_415, principal: 500_000,
                 progress: 0.2, monthsPaid: 8, tenureMonths: 36, monthlyPayment: 16_131,
                 annualInterestRate: 0.0999, nextEMIDate: next, daysUntilNextEMI: 7,
-                iconKey: "person", isPinned: false, missedEMIs: 0
+                iconKey: "person", isPinned: false, missedEMIs: 0, currencyCode: "INR"
             ),
             followUps: []
         )
@@ -666,7 +683,7 @@ struct NextEMIWidgetView: View {
             Text(loan.name)
                 .font(.caption.weight(.semibold))
                 .lineLimit(1)
-            Text(loan.monthlyPayment, format: .inrFull)
+            Text(loan.monthlyPayment, format: .full(code: loan.currencyCode))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .monospacedDigit()
@@ -690,7 +707,7 @@ struct NextEMIWidgetView: View {
                 Text(loan.name)
                     .font(.caption.weight(.semibold))
                     .lineLimit(1)
-                Text(loan.monthlyPayment, format: .inrFull)
+                Text(loan.monthlyPayment, format: .full(code: loan.currencyCode))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
@@ -864,7 +881,7 @@ struct RingProvider: AppIntentTimelineProvider {
                          progress: 0.32, monthsPaid: 12, tenureMonths: 60,
                          monthlyPayment: 25000, annualInterestRate: 0.085,
                          nextEMIDate: nil, daysUntilNextEMI: nil,
-                         iconKey: "home", isPinned: false, missedEMIs: 0)
+                         iconKey: "home", isPinned: false, missedEMIs: 0, currencyCode: "INR")
         ], selectedLoanID: nil)
     }
 
@@ -889,6 +906,12 @@ struct RingProgressWidgetView: View {
             return [one]
         }
         return entry.snapshots
+    }
+
+    /// Currency code used for display — if all tracked loans share a currency, use it; else INR.
+    private var dominantCurrency: String {
+        let codes = Set(trackedLoans.map(\.currencyCode))
+        return codes.count == 1 ? (codes.first ?? "INR") : "INR"
     }
 
     /// Progress = 1 - remaining/principal across tracked loans.
@@ -947,7 +970,7 @@ struct RingProgressWidgetView: View {
                         .font(.system(size: 28, weight: .bold, design: .rounded))
                         .monospacedDigit()
                    HStack(spacing: 2) {
-                        Text(totalRemaining, format: .inrCompact)
+                        Text(totalRemaining, format: .compact(code: dominantCurrency))
                             .monospacedDigit()
                         Text("left")
                             .foregroundStyle(.secondary)

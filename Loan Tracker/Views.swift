@@ -5,18 +5,15 @@ import Charts
 
 // MARK: - Formatting
 
-/// Compact Indian-rupee formatting for tight spaces.
-/// Used as a fallback when the full grouped format ("₹21,28,216.00") doesn't fit.
-/// - 1 Cr+ → "₹1.5Cr"
-/// - 1 L+  → "₹4.0L"
-/// - 1 K+  → "₹65K"
-/// - else  → "₹999"
-func compactINR(_ amount: Double) -> String {
+/// Currency-aware compact formatting for tight spaces (chart axes, widgets).
+/// Uses standard K/M/B notation, readable across all locales.
+func compactCurrency(_ amount: Double, code: String) -> String {
+    let symbol = SupportedCurrency(rawValue: code)?.symbol ?? code
     let abs = Swift.abs(amount)
-    if abs >= 10_000_000 { return String(format: "₹%.1fCr", amount / 10_000_000) }
-    if abs >= 100_000    { return String(format: "₹%.1fL", amount / 100_000) }
-    if abs >= 1_000      { return "₹\(Int(amount / 1_000))K" }
-    return "₹\(Int(amount))"
+    if abs >= 1_000_000_000 { return "\(symbol)\(String(format: "%.1f", amount / 1_000_000_000))B" }
+    if abs >= 1_000_000     { return "\(symbol)\(String(format: "%.1f", amount / 1_000_000))M" }
+    if abs >= 1_000         { return "\(symbol)\(Int(amount / 1_000))K" }
+    return "\(symbol)\(Int(amount))"
 }
 
 // MARK: - Home
@@ -29,7 +26,13 @@ struct HomeView: View {
     @State private var quickPayLoan: Loan?  // when set, opens AddPayment pre-filled
     @State private var showingExportSheet = false
     @State private var showingImportSheet = false
-    @State private var showingSettings = false        // ← add this
+    @State private var showingSettings = false
+    @State private var showingDocumentImport = false
+    @State private var documentImportURL: URL?
+    @State private var searchText = ""
+    @State private var filterActive: Bool? = nil  // nil=all, true=active, false=closed
+    @State private var loanToDelete: IndexSet?
+    @State private var showingDeleteConfirmation = false
     @State private var nudgeTargetLoan: Loan?         // drill-down target from a nudge tap
     @State private var nudgeTargetKind: NudgeKind?    // tracks which kind triggered the drill-down
     @State private var nudgeRefreshTrigger = UUID()   // bumped on dismiss to recompute
@@ -39,10 +42,25 @@ struct HomeView: View {
     /// Pinned loans float to the top, then chronological by creation.
     /// Sorted in-memory since SwiftData's SortDescriptor doesn't accept Bool.
     private var loans: [Loan] {
-        allLoans.sorted { a, b in
-            if a.isPinned != b.isPinned { return a.isPinned }
-            return a.createdAt < b.createdAt
-        }
+        allLoans
+            .filter { loan in
+                // Status filter
+                if let active = filterActive {
+                    let isActive = loan.remainingBalance > 0.01
+                    if active != isActive { return false }
+                }
+                // Search filter
+                if !searchText.isEmpty {
+                    let q = searchText.lowercased()
+                    return loan.name.lowercased().contains(q)
+                        || loan.bankName.lowercased().contains(q)
+                }
+                return true
+            }
+            .sorted { a, b in
+                if a.isPinned != b.isPinned { return a.isPinned }
+                return a.createdAt < b.createdAt
+            }
     }
 
     private var totalRemaining: Double {
@@ -52,6 +70,22 @@ struct HomeView: View {
     /// Sum of EMIs across active loans — what the user must set aside each month.
     private var totalMonthlyEMI: Double {
         loans.filter { $0.remainingBalance > 0.01 }.reduce(0) { $0 + $1.monthlyPayment }
+    }
+
+    /// Grouped totals by currency for multi-currency portfolios.
+    private var currencyTotals: [(code: String, remaining: Double, emi: Double)] {
+        let active = loans.filter { $0.remainingBalance > 0.01 }
+        let grouped = Dictionary(grouping: active, by: { $0.currencyCode })
+        return grouped.map { code, loans in
+            (code: code, remaining: loans.reduce(0) { $0 + $1.remainingBalance },
+             emi: loans.reduce(0) { $0 + $1.monthlyPayment })
+        }
+        .sorted { $0.remaining > $1.remaining }
+    }
+
+    private var dominantCurrency: String {
+        currencyTotals.first?.code ?? loans.first?.currencyCode
+            ?? Locale.current.currency?.identifier ?? "USD"
     }
 
     /// Overall debt-paydown progress across all loans, 0...1.
@@ -106,27 +140,52 @@ struct HomeView: View {
             List {
                 Section {
                     VStack(alignment: .leading, spacing: 12) {
-                        VStack(alignment: .leading, spacing: 4) {
+                        if currencyTotals.count <= 1 {
+                            // Single currency — big hero total
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Total Remaining")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(totalRemaining, format: .currency(code: dominantCurrency))
+                                    .font(.system(size: 32, weight: .bold, design: .rounded))
+                                    .minimumScaleFactor(0.7)
+                                    .lineLimit(1)
+                            }
+
+                            if totalMonthlyEMI > 0 {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "calendar.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                    Text("Monthly EMIs:")
+                                        .foregroundStyle(.secondary)
+                                    Text(totalMonthlyEMI, format: .currency(code: dominantCurrency).precision(.fractionLength(0)))
+                                        .fontWeight(.semibold)
+                                        .monospacedDigit()
+                                }
+                                .font(.subheadline)
+                            }
+                        } else {
+                            // Multi-currency — per-currency rows
                             Text("Total Remaining")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            Text(totalRemaining, format: .currency(code: "INR"))
-                                .font(.system(size: 32, weight: .bold, design: .rounded))
-                                .minimumScaleFactor(0.7)
-                                .lineLimit(1)
-                        }
-
-                        if totalMonthlyEMI > 0 {
-                            HStack(spacing: 6) {
-                                Image(systemName: "calendar.circle.fill")
-                                    .foregroundStyle(.secondary)
-                                Text("Monthly EMIs:")
-                                    .foregroundStyle(.secondary)
-                                Text(totalMonthlyEMI, format: .currency(code: "INR").precision(.fractionLength(0)))
-                                    .fontWeight(.semibold)
-                                    .monospacedDigit()
+                            ForEach(currencyTotals, id: \.code) { total in
+                                HStack {
+                                    Text(total.remaining, format: .currency(code: total.code))
+                                        .font(.system(size: 24, weight: .bold, design: .rounded))
+                                        .minimumScaleFactor(0.7)
+                                        .lineLimit(1)
+                                    Spacer()
+                                    if total.emi > 0 {
+                                        Text(total.emi, format: .currency(code: total.code).precision(.fractionLength(0)))
+                                            .font(.subheadline)
+                                            .foregroundStyle(.secondary)
+                                        Text("/mo")
+                                            .font(.caption2)
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                }
                             }
-                            .font(.subheadline)
                         }
 
                         if let date = debtFreeDate {
@@ -196,7 +255,7 @@ struct HomeView: View {
                 if loans.isEmpty {
                     ContentUnavailableView(
                         "No loans yet",
-                        systemImage: "indianrupeesign.circle",
+                        systemImage: "banknote",
                         description: Text("Tap + to add your first loan.")
                     )
                 } else {
@@ -242,7 +301,7 @@ struct HomeView: View {
                                     Button {
                                         quickPayLoan = loan
                                     } label: {
-                                        Label("Pay EMI", systemImage: "indianrupeesign.circle.fill")
+                                        Label("Pay EMI", systemImage: "banknote.fill")
                                     }
                                     .tint(.green)
                                 }
@@ -255,7 +314,10 @@ struct HomeView: View {
                                 .tint(.orange)
                             }
                         }
-                        .onDelete(perform: deleteLoans)
+                        .onDelete { offsets in
+                            loanToDelete = offsets
+                            showingDeleteConfirmation = true
+                        }
                         // Smoothly animate row reordering when a loan is pinned/unpinned.
                         // Keyed to the loan-id order so SwiftUI only triggers on
                         // actual order changes, not on every render.
@@ -295,10 +357,29 @@ struct HomeView: View {
                         Button("Add Loan", systemImage: "doc.badge.plus") {
                             showingAddLoan = true
                         }
+                        Divider()
+                        Button("Scan Document", systemImage: "doc.viewfinder") {
+                            documentImportURL = nil
+                            showingDocumentImport = true
+                        }
                     } label: {
                         Image(systemName: "plus")
                     }
                 }
+            }
+            .searchable(text: $searchText, prompt: "Search loans…")
+            .confirmationDialog(
+                "Delete Loan",
+                isPresented: $showingDeleteConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Delete", role: .destructive) {
+                    if let offsets = loanToDelete {
+                        deleteLoans(at: offsets)
+                    }
+                }
+            } message: {
+                Text("This will permanently delete this loan and all its payment history. This cannot be undone.")
             }
             .sheet(isPresented: $showingAddLoan) { LoanFormView() }
             .sheet(isPresented: $showingAddPayment) {
@@ -315,6 +396,9 @@ struct HomeView: View {
             }.sheet(isPresented: $showingSettings) {
                 SettingsView()
             }
+            .sheet(isPresented: $showingDocumentImport) {
+                DocumentImportView(importedFileURL: documentImportURL)
+            }
             .navigationDestination(item: $nudgeTargetLoan) { loan in
                 // Auto-scroll to the Playground only for nudges that suggest a
                 // prepayment action — others (ahead/closing/milestone) drill in
@@ -328,6 +412,9 @@ struct HomeView: View {
                 switch newRoute {
                 case .addPayment: showingAddPayment = true
                 case .addLoan:    showingAddLoan = true
+                case .importDocument(let url):
+                    documentImportURL = url
+                    showingDocumentImport = true
                 }
                 deepLinkRoute = nil
             }
@@ -427,11 +514,11 @@ struct LoanRow: View {
                     // Show the full grouped format when it fits; fall back to
                     // compact (₹4.0L, ₹21.3L, ₹1.5Cr) when the row is tight.
                     ViewThatFits(in: .horizontal) {
-                        Text(loan.remainingBalance, format: .currency(code: "INR"))
+                        Text(loan.remainingBalance, format: .currency(code: loan.currencyCode))
                             .font(.subheadline.bold())
                             .monospacedDigit()
                             .lineLimit(1)
-                        Text(compactINR(loan.remainingBalance))
+                        Text(loan.remainingBalance, format: .currency(code: loan.currencyCode).precision(.fractionLength(0)).notation(.compactName))
                             .font(.subheadline.bold())
                             .monospacedDigit()
                             .lineLimit(1)
@@ -486,11 +573,26 @@ struct LoanRow: View {
 struct RecentPaymentRow: View {
     let payment: Payment
 
+    private var currencyCode: String {
+        payment.loan?.currencyCode ?? "INR"
+    }
+
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
-                Text(payment.loan?.name ?? "—")
-                    .font(.subheadline.weight(.medium))
+                HStack(spacing: 6) {
+                    Text(payment.loan?.name ?? "—")
+                        .font(.subheadline.weight(.medium))
+                    if payment.paymentType == .prepayment {
+                        Text("Prepayment")
+                            .font(.system(size: 9, weight: .semibold))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.green.opacity(0.15))
+                            .foregroundStyle(.green)
+                            .clipShape(Capsule())
+                    }
+                }
                 if let note = payment.note, !note.isEmpty {
                     Text(note)
                         .font(.caption)
@@ -500,7 +602,7 @@ struct RecentPaymentRow: View {
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 2) {
-                Text(payment.amount, format: .currency(code: "INR"))
+                Text(payment.amount, format: .currency(code: currencyCode))
                     .font(.subheadline.weight(.semibold))
                     .monospacedDigit()
                 Text(payment.date, format: .dateTime.day().month(.abbreviated))
@@ -518,6 +620,11 @@ struct LoanDetailView: View {
     @Environment(\.modelContext) private var context
     @State private var showingAddPayment = false
     @State private var showingEditLoan = false
+    @State private var showingRateHistory = false
+    @State private var showingRefinanceAnalyzer = false
+    @State private var showingDocuments = false
+    @State private var showingCelebration = false
+    @State private var showingDocumentImport = false
     /// When true, the view auto-scrolls to the Playground section on appear.
     /// Used when navigating in from a "try prepayment" nudge.
     var autoScrollToPlayground: Bool = false
@@ -542,7 +649,7 @@ struct LoanDetailView: View {
                             Text("Remaining")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            Text(loan.remainingBalance, format: .currency(code: "INR"))
+                            Text(loan.remainingBalance, format: .currency(code: loan.currencyCode))
                                 .font(.system(size: 30, weight: .bold, design: .rounded))
                                 .minimumScaleFactor(0.6)
                                 .lineLimit(1)
@@ -640,8 +747,26 @@ struct LoanDetailView: View {
                 HStack {
                     Text("Rate")
                     Spacer()
-                    Text(loan.annualInterestRate, format: .percent.precision(.fractionLength(2)))
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 4) {
+                        Text(loan.annualInterestRate, format: .percent.precision(.fractionLength(2)))
+                        Text(loan.isFloatingRate ? "(Floating)" : "(Fixed)")
+                            .font(.caption2)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+                if !loan.bankName.isEmpty {
+                    HStack {
+                        Text("Bank")
+                        Spacer()
+                        Text(loan.bankName).foregroundStyle(.secondary)
+                    }
+                }
+                if loan.prepaymentPenaltyPercent > 0 {
+                    HStack {
+                        Text("Prepayment Penalty")
+                        Spacer()
+                        Text("\(loan.prepaymentPenaltyPercent, specifier: "%.1f")%").foregroundStyle(.secondary)
+                    }
                 }
                 HStack {
                     Text("Tenure")
@@ -685,7 +810,7 @@ struct LoanDetailView: View {
                         HStack {
                             Text("Paid in That Period")
                             Spacer()
-                            Text(loan.paidBeforeTracking, format: .currency(code: "INR"))
+                            Text(loan.paidBeforeTracking, format: .currency(code: loan.currencyCode))
                                 .foregroundStyle(.secondary)
                         }
                     }
@@ -715,6 +840,17 @@ struct LoanDetailView: View {
                 }
             }
 
+            // MARK: Amortization Schedule
+            if loan.remainingBalance > 0.01 {
+                Section {
+                    NavigationLink {
+                        AmortizationScheduleView(loan: loan)
+                    } label: {
+                        Label("Amortization Schedule", systemImage: "tablecells")
+                    }
+                }
+            }
+
             // MARK: Playground
             if loan.remainingBalance > 0.01 {
                 Section {
@@ -735,8 +871,19 @@ struct LoanDetailView: View {
                     ForEach(loan.payments.sorted { $0.date > $1.date }) { p in
                         HStack {
                             VStack(alignment: .leading) {
-                                Text(p.amount, format: .currency(code: "INR"))
-                                    .font(.headline)
+                                HStack(spacing: 6) {
+                                    Text(p.amount, format: .currency(code: loan.currencyCode))
+                                        .font(.headline)
+                                    if p.paymentType == .prepayment {
+                                        Text("Prepayment")
+                                            .font(.caption2.weight(.semibold))
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color.green.opacity(0.15))
+                                            .foregroundStyle(.green)
+                                            .clipShape(Capsule())
+                                    }
+                                }
                                 if let note = p.note, !note.isEmpty {
                                     Text(note).font(.caption).foregroundStyle(.secondary)
                                 }
@@ -770,6 +917,21 @@ struct LoanDetailView: View {
                     Button("Edit Loan", systemImage: "pencil") {
                         showingEditLoan = true
                     }
+                    if loan.isFloatingRate {
+                        Button("Rate Change History", systemImage: "chart.line.uptrend.xyaxis") {
+                            showingRateHistory = true
+                        }
+                    }
+                    Button("Refinance Analyzer", systemImage: "arrow.triangle.2.circlepath") {
+                        showingRefinanceAnalyzer = true
+                    }
+                    Button("Documents", systemImage: "doc.text") {
+                        showingDocuments = true
+                    }
+                    Divider()
+                    Button("Import Document", systemImage: "doc.viewfinder") {
+                        showingDocumentImport = true
+                    }
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
@@ -786,13 +948,54 @@ struct LoanDetailView: View {
         .sheet(isPresented: $showingEditLoan) {
             LoanFormView(loan: loan)
         }
+        .sheet(isPresented: $showingRateHistory) {
+            NavigationStack {
+                RateChangeHistoryView(loan: loan)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showingRateHistory = false }
+                        }
+                    }
+            }
+        }
+        .sheet(isPresented: $showingRefinanceAnalyzer) {
+            NavigationStack {
+                RefinanceAnalyzerView(loan: loan)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showingRefinanceAnalyzer = false }
+                        }
+                    }
+            }
+        }
+        .sheet(isPresented: $showingDocuments) {
+            NavigationStack {
+                LoanDocumentsView(loan: loan)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showingDocuments = false }
+                        }
+                    }
+            }
+        }
+        .sheet(isPresented: $showingDocumentImport) {
+            DocumentImportView(targetLoan: loan)
+        }
+        .fullScreenCover(isPresented: $showingCelebration) {
+            LoanCelebrationView(
+                loanName: loan.name,
+                totalPaid: loan.payments.reduce(0) { $0 + $1.amount },
+                currencyCode: loan.currencyCode,
+                onDismiss: { showingCelebration = false }
+            )
+        }
     }
 
     private func summaryRow(_ label: String, _ value: Double, emphasized: Bool = false) -> some View {
         HStack {
             Text(label)
             Spacer()
-            Text(value, format: .currency(code: "INR"))
+            Text(value, format: .currency(code: loan.currencyCode))
                 .fontWeight(emphasized ? .bold : .regular)
                 .foregroundStyle(emphasized ? .primary : .secondary)
         }
@@ -800,7 +1003,11 @@ struct LoanDetailView: View {
 
     private func deletePayments(at offsets: IndexSet) {
         let sorted = loan.payments.sorted { $0.date > $1.date }
-        for index in offsets { context.delete(sorted[index]) }
+        for index in offsets {
+            let payment = sorted[index]
+            loan.payments.removeAll { $0.persistentModelID == payment.persistentModelID }
+            context.delete(payment)
+        }
         try? context.save()
         refreshAppState()
     }
@@ -812,82 +1019,173 @@ struct PrepaymentPlayground: View {
     let loan: Loan
     @State private var lumpSum: Double = 0
     @State private var extraMonthly: Double = 0
+    @State private var strategy: PrepaymentStrategy = .reduceTenure
     /// Computed once on first appearance — baseline never changes during the
     /// playground session, so caching avoids recomputing it on every slider tick.
     @State private var baselineTrajectory: [Double] = []
+
+    private var cc: String { loan.currencyCode }
 
     private var baseline: PrepaymentProjection? {
         loan.projection(extraLumpSum: 0, extraMonthly: 0)
     }
 
     private var scenario: PrepaymentProjection? {
-        loan.projection(extraLumpSum: lumpSum, extraMonthly: extraMonthly)
+        loan.projection(extraLumpSum: effectiveLump, extraMonthly: extraMonthly)
     }
 
     private var hasPrepayment: Bool {
         lumpSum > 0 || extraMonthly > 0
     }
 
-    private var maxLumpSum: Double {
-        max(10_000, ceil(loan.remainingBalance / 10_000) * 10_000)
+    /// Net prepayment after deducting penalty
+    private var effectiveLump: Double {
+        loan.effectivePrepayment(lumpSum)
     }
 
-    private var maxExtraMonthly: Double {
-        max(1_000, ceil(loan.monthlyPayment * 2 / 500) * 500)
+    private var penaltyAmount: Double {
+        lumpSum * loan.prepaymentPenaltyPercent / 100.0
     }
+
+    /// Adaptive slider step size based on the amount range (works for any currency).
+    private func niceStep(for range: Double, targetSteps: Double = 100) -> Double {
+        guard range > 0 else { return 1 }
+        let rawStep = range / targetSteps
+        let magnitude = pow(10, floor(log10(rawStep)))
+        let normalized = rawStep / magnitude
+        if normalized <= 1 { return magnitude }
+        if normalized <= 2 { return 2 * magnitude }
+        if normalized <= 5 { return 5 * magnitude }
+        return 10 * magnitude
+    }
+
+    private var maxLumpSum: Double {
+        let step = niceStep(for: loan.remainingBalance)
+        return max(step, ceil(loan.remainingBalance / step) * step)
+    }
+
+    private var lumpSumStep: Double { niceStep(for: maxLumpSum) }
+
+    private var maxExtraMonthly: Double {
+        let range = loan.monthlyPayment * 2
+        let step = niceStep(for: range)
+        return max(step, ceil(range / step) * step)
+    }
+
+    private var extraMonthlyStep: Double { niceStep(for: maxExtraMonthly) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("One-time prepayment")
                 Spacer()
-                Text(lumpSum, format: .currency(code: "INR").precision(.fractionLength(0)))
+                Text(lumpSum, format: .currency(code: cc).precision(.fractionLength(0)))
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
-            Slider(value: $lumpSum, in: 0...maxLumpSum, step: 1_000)
+            Slider(value: $lumpSum, in: 0...maxLumpSum, step: lumpSumStep)
+                .sensoryFeedback(.selection, trigger: Int(lumpSum / (lumpSumStep * 5)))
+
+            // Show penalty deduction if applicable
+            if lumpSum > 0 && loan.prepaymentPenaltyPercent > 0 {
+                HStack(spacing: 4) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text("Penalty \(loan.prepaymentPenaltyPercent, specifier: "%.1f")%: \(penaltyAmount, format: .currency(code: cc).precision(.fractionLength(0)))")
+                    Text("· Net: \(effectiveLump, format: .currency(code: cc).precision(.fractionLength(0)))")
+                        .fontWeight(.medium)
+                }
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
         }
 
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Extra monthly")
                 Spacer()
-                Text(extraMonthly, format: .currency(code: "INR").precision(.fractionLength(0)))
+                Text(extraMonthly, format: .currency(code: cc).precision(.fractionLength(0)))
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
-            Slider(value: $extraMonthly, in: 0...maxExtraMonthly, step: 100)
-            // Clarify: the "extra" gets ADDED to the regular EMI. Show the
-            // resulting total so the user doesn't have to do the math.
+            Slider(value: $extraMonthly, in: 0...maxExtraMonthly, step: extraMonthlyStep)
+                .sensoryFeedback(.selection, trigger: Int(extraMonthly / (extraMonthlyStep * 5)))
             if extraMonthly > 0 {
-                Text("EMI becomes \((loan.monthlyPayment + extraMonthly), format: .currency(code: "INR").precision(.fractionLength(0)))/mo")
+                Text("EMI becomes \((loan.monthlyPayment + extraMonthly), format: .currency(code: cc).precision(.fractionLength(0)))/mo")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             } else {
-                Text("On top of your regular ₹\(Int(loan.monthlyPayment)) EMI")
+                Text("On top of your regular \(loan.monthlyPayment, format: .currency(code: cc).precision(.fractionLength(0))) EMI")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
         }
 
-        // Balance decline chart — live updates on every slider tick.
-        // Baseline is cached; scenario recomputes per frame.
-        BalanceTrajectoryChart(
-            baseline: baselineTrajectory,
-            scenario: hasPrepayment ? loan.balanceTrajectory(extraLumpSum: lumpSum, extraMonthly: extraMonthly) : nil
-        )
-        .onAppear {
-            if baselineTrajectory.isEmpty {
-                baselineTrajectory = loan.balanceTrajectory()
+        // Strategy picker — only relevant when there's a lump-sum prepayment
+        if lumpSum > 0 {
+            Picker("After prepayment", selection: $strategy) {
+                ForEach(PrepaymentStrategy.allCases) { s in
+                    Text(s.rawValue).tag(s)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(.vertical, 4)
+
+            Text(strategy.description)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+
+            if strategy == .reduceEMI, let newEMI = loan.reducedEMI(afterPrepayment: effectiveLump) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("New EMI")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(newEMI, format: .currency(code: cc).precision(.fractionLength(0)))
+                            .font(.title3.bold())
+                            .foregroundStyle(.green)
+                            .monospacedDigit()
+                    }
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text("Monthly savings")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(max(0, loan.monthlyPayment - newEMI), format: .currency(code: cc).precision(.fractionLength(0)))
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.green)
+                            .monospacedDigit()
+                    }
+                }
+                .padding(.vertical, 4)
             }
         }
 
-        if hasPrepayment, let base = baseline, let scen = scenario {
+        // Balance decline chart — live updates on every slider tick.
+        // Shown for "reduce tenure" strategy; reduce EMI keeps same timeline.
+        if strategy == .reduceTenure || !hasPrepayment {
+            BalanceTrajectoryChart(
+                baseline: baselineTrajectory,
+                scenario: hasPrepayment ? loan.balanceTrajectory(extraLumpSum: effectiveLump, extraMonthly: extraMonthly) : nil,
+                currencyCode: cc
+            )
+            .onAppear {
+                if baselineTrajectory.isEmpty {
+                    baselineTrajectory = loan.balanceTrajectory()
+                }
+            }
+        }
+
+        if hasPrepayment && strategy == .reduceTenure, let base = baseline, let scen = scenario {
             resultView(baseline: base, scenario: scen)
+        }
+
+        if hasPrepayment {
             Button(role: .destructive) {
                 withAnimation {
                     lumpSum = 0
                     extraMonthly = 0
+                    strategy = .reduceTenure
                 }
             } label: {
                 HStack {
@@ -896,10 +1194,6 @@ struct PrepaymentPlayground: View {
                     Spacer()
                 }
             }
-        } else if hasPrepayment {
-            Text("Couldn't compute projection.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
     }
 
@@ -947,7 +1241,7 @@ struct PrepaymentPlayground: View {
                     Text("Interest saved")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text(interestSaved, format: .currency(code: "INR").precision(.fractionLength(0)))
+                    Text(interestSaved, format: .currency(code: cc).precision(.fractionLength(0)))
                         .font(.title3.bold())
                         .foregroundStyle(.green)
                         .monospacedDigit()
@@ -957,8 +1251,8 @@ struct PrepaymentPlayground: View {
                     Text("Balance after")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text(max(0, loan.remainingBalance - lumpSum),
-                         format: .currency(code: "INR").precision(.fractionLength(0)))
+                    Text(max(0, loan.remainingBalance - effectiveLump),
+                         format: .currency(code: cc).precision(.fractionLength(0)))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
@@ -971,7 +1265,7 @@ struct PrepaymentPlayground: View {
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                     Text(baseline.totalCashRemaining,
-                         format: .currency(code: "INR").precision(.fractionLength(0)))
+                         format: .currency(code: cc).precision(.fractionLength(0)))
                         .font(.subheadline.bold())
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
@@ -982,7 +1276,7 @@ struct PrepaymentPlayground: View {
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                     Text(scenario.totalCashRemaining,
-                         format: .currency(code: "INR").precision(.fractionLength(0)))
+                         format: .currency(code: cc).precision(.fractionLength(0)))
                         .font(.subheadline.bold())
                         .foregroundStyle(.primary)
                         .monospacedDigit()
@@ -1003,6 +1297,8 @@ struct BalanceTrajectoryChart: View {
     let baseline: [Double]
     /// nil when there's no prepayment — chart shows just the baseline curve.
     let scenario: [Double]?
+    /// Currency code for y-axis formatting.
+    var currencyCode: String = "USD"
 
     /// Max chart points per curve. Visually indistinguishable from rendering
     /// every monthly point, but ~5x less work for SwiftUI's diff engine when
@@ -1032,11 +1328,9 @@ struct BalanceTrajectoryChart: View {
         scenario.map { downsample($0) }
     }
 
-    /// Compact INR formatting for chart y-axis labels (₹4L, ₹50K, etc.).
+    /// Compact currency formatting for chart y-axis labels.
     private func compact(_ v: Double) -> String {
-        if v >= 100_000 { return String(format: "₹%.1fL", v / 100_000) }
-        if v >= 1_000   { return "₹\(Int(v / 1_000))K" }
-        return "₹\(Int(v))"
+        compactCurrency(v, code: currencyCode)
     }
 
     /// Y-axis upper bound — slightly above the starting balance so the curve
@@ -1206,16 +1500,18 @@ struct LoanFormView: View {
     @State private var currentOutstanding: Double
     @State private var elapsedMonths: Double
     @State private var selectedIcon: LoanIcon
-    /// First EMI date — auto-populated to startDate + 1 month, but the user can
-    /// change it freely (for loans with a Pre-EMI period before full EMIs begin).
-    /// The day component of this date IS the EMI day; no separate stepper needed.
     @State private var firstEMIDate: Date
-    /// Tracks whether the user has manually touched the first EMI date.
-    /// When false, startDate changes auto-update firstEMIDate; once edited, it stays put.
     @State private var firstEMIUserEdited: Bool
+    @State private var selectedCurrency: SupportedCurrency
+    @State private var isFloatingRate: Bool
+    @State private var prepaymentPenaltyPercent: Double
+    @State private var bankName: String
+    @State private var showingTemplatePicker = false
 
     init(loan: Loan? = nil) {
         self.existingLoan = loan
+        let savedCurrency = UserDefaults.standard.string(forKey: "defaultCurrency")
+            ?? Locale.current.currency?.identifier ?? "USD"
         if let loan = loan {
             _name = State(initialValue: loan.name)
             _principal = State(initialValue: loan.principal)
@@ -1231,13 +1527,17 @@ struct LoanFormView: View {
             _selectedIcon = State(initialValue: LoanIcon.resolve(loan.iconKey))
             _firstEMIDate = State(initialValue: loan.firstEMIDate ?? loan.effectiveFirstEMIDate)
             _firstEMIUserEdited = State(initialValue: true)
+            _selectedCurrency = State(initialValue: SupportedCurrency(rawValue: loan.currencyCode) ?? .inr)
+            _isFloatingRate = State(initialValue: loan.isFloatingRate)
+            _prepaymentPenaltyPercent = State(initialValue: loan.prepaymentPenaltyPercent)
+            _bankName = State(initialValue: loan.bankName)
         } else {
             _name = State(initialValue: "")
             _principal = State(initialValue: 0)
-            _ratePercent = State(initialValue: 8.5)
+            _ratePercent = State(initialValue: 0)
             _emi = State(initialValue: 0)
             _startDate = State(initialValue: .now)
-            _tenureValue = State(initialValue: 20)
+            _tenureValue = State(initialValue: 0)
             _tenureUnit = State(initialValue: .years)
             _paidBeforeTracking = State(initialValue: 0)
             _currentOutstanding = State(initialValue: 0)
@@ -1245,7 +1545,90 @@ struct LoanFormView: View {
             _selectedIcon = State(initialValue: .generic)
             _firstEMIDate = State(initialValue: Calendar.current.date(byAdding: .month, value: 1, to: .now) ?? .now)
             _firstEMIUserEdited = State(initialValue: false)
+            _selectedCurrency = State(initialValue: SupportedCurrency(rawValue: savedCurrency) ?? .usd)
+            _isFloatingRate = State(initialValue: false)
+            _prepaymentPenaltyPercent = State(initialValue: 0)
+            _bankName = State(initialValue: "")
         }
+    }
+
+    /// Initialize with an existing loan and pre-filled values from document scanning.
+    /// Extracted fields override the loan's current values; unextracted fields keep the loan's data.
+    init(loan: Loan, prefill: LoanPrefill) {
+        self.existingLoan = loan
+        _name = State(initialValue: prefill.name ?? loan.name)
+        _principal = State(initialValue: prefill.principal ?? loan.principal)
+        _ratePercent = State(initialValue: prefill.ratePercent ?? (loan.annualInterestRate * 100))
+        _emi = State(initialValue: prefill.emi ?? loan.monthlyPayment)
+        _startDate = State(initialValue: prefill.startDate ?? loan.startDate)
+        if let months = prefill.tenureMonths, months > 0 {
+            let (tv, tu) = Self.splitTenure(months)
+            _tenureValue = State(initialValue: tv)
+            _tenureUnit = State(initialValue: tu)
+        } else {
+            let (tv, tu) = Self.splitTenure(loan.tenureMonths)
+            _tenureValue = State(initialValue: tv)
+            _tenureUnit = State(initialValue: tu)
+        }
+        _paidBeforeTracking = State(initialValue: loan.paidBeforeTracking)
+        _currentOutstanding = State(initialValue: prefill.currentOutstanding ?? loan.currentOutstanding)
+        _elapsedMonths = State(initialValue: loan.elapsedMonths)
+        _selectedIcon = State(initialValue: LoanIcon.resolve(loan.iconKey))
+        if let day = prefill.emiDay, (1...31).contains(day) {
+            let base = prefill.startDate ?? loan.startDate
+            var comps = Calendar.current.dateComponents([.year, .month], from: base)
+            comps.month = (comps.month ?? 1) + 1
+            comps.day = day
+            _firstEMIDate = State(initialValue: Calendar.current.date(from: comps) ?? loan.effectiveFirstEMIDate)
+            _firstEMIUserEdited = State(initialValue: true)
+        } else {
+            _firstEMIDate = State(initialValue: loan.firstEMIDate ?? loan.effectiveFirstEMIDate)
+            _firstEMIUserEdited = State(initialValue: true)
+        }
+        _selectedCurrency = State(initialValue: SupportedCurrency(rawValue: prefill.currencyCode ?? loan.currencyCode) ?? .inr)
+        _isFloatingRate = State(initialValue: prefill.isFloatingRate ?? loan.isFloatingRate)
+        _prepaymentPenaltyPercent = State(initialValue: prefill.prepaymentPenaltyPercent ?? loan.prepaymentPenaltyPercent)
+        _bankName = State(initialValue: prefill.bankName ?? loan.bankName)
+    }
+
+    /// Initialize with pre-filled values from document scanning.
+    /// Fields not extracted are given sensible defaults.
+    init(prefill: LoanPrefill) {
+        self.existingLoan = nil
+        let savedCurrency = UserDefaults.standard.string(forKey: "defaultCurrency")
+            ?? Locale.current.currency?.identifier ?? "USD"
+        _name = State(initialValue: prefill.name ?? "")
+        _principal = State(initialValue: prefill.principal ?? 0)
+        _ratePercent = State(initialValue: prefill.ratePercent ?? 0)
+        _emi = State(initialValue: prefill.emi ?? 0)
+        _startDate = State(initialValue: prefill.startDate ?? .now)
+        if let months = prefill.tenureMonths, months > 0 {
+            let (tv, tu) = Self.splitTenure(months)
+            _tenureValue = State(initialValue: tv)
+            _tenureUnit = State(initialValue: tu)
+        } else {
+            _tenureValue = State(initialValue: 20)
+            _tenureUnit = State(initialValue: .years)
+        }
+        _paidBeforeTracking = State(initialValue: 0)
+        _currentOutstanding = State(initialValue: prefill.currentOutstanding ?? 0)
+        _elapsedMonths = State(initialValue: 0)
+        _selectedIcon = State(initialValue: .generic)
+        if let day = prefill.emiDay, (1...31).contains(day),
+           let start = prefill.startDate {
+            var comps = Calendar.current.dateComponents([.year, .month], from: start)
+            comps.month = (comps.month ?? 1) + 1
+            comps.day = day
+            _firstEMIDate = State(initialValue: Calendar.current.date(from: comps) ?? start)
+            _firstEMIUserEdited = State(initialValue: true)
+        } else {
+            _firstEMIDate = State(initialValue: Calendar.current.date(byAdding: .month, value: 1, to: prefill.startDate ?? .now) ?? .now)
+            _firstEMIUserEdited = State(initialValue: false)
+        }
+        _selectedCurrency = State(initialValue: SupportedCurrency(rawValue: prefill.currencyCode ?? savedCurrency) ?? .usd)
+        _isFloatingRate = State(initialValue: prefill.isFloatingRate ?? true)
+        _prepaymentPenaltyPercent = State(initialValue: prefill.prepaymentPenaltyPercent ?? 0)
+        _bankName = State(initialValue: prefill.bankName ?? "")
     }
 
     private var isEditing: Bool { existingLoan != nil }
@@ -1281,6 +1664,15 @@ struct LoanFormView: View {
                     TextField("Name (e.g. Home Loan)", text: $name)
                         .textInputAutocapitalization(.words)
                         .autocorrectionDisabled()
+
+                    if existingLoan == nil {
+                        Button {
+                            showingTemplatePicker = true
+                        } label: {
+                            Label("Use Bank Template", systemImage: "building.columns")
+                        }
+                    }
+
                     numberRow("Principal", value: $principal)
                     numberRow("Interest Rate %", value: $ratePercent)
                     numberRow("Monthly EMI", value: $emi)
@@ -1325,6 +1717,35 @@ struct LoanFormView: View {
                 }
 
                 Section {
+                    Picker("Currency", selection: $selectedCurrency) {
+                        ForEach(SupportedCurrency.allCases) { currency in
+                            Text(currency.label).tag(currency)
+                        }
+                    }
+
+                    TextField("Bank Name (optional)", text: $bankName)
+                        .textInputAutocapitalization(.words)
+
+                    Picker("Rate Type", selection: $isFloatingRate) {
+                        Text("Floating").tag(true)
+                        Text("Fixed").tag(false)
+                    }
+                    .pickerStyle(.segmented)
+
+                    if !isFloatingRate || prepaymentPenaltyPercent > 0 {
+                        numberRow("Prepayment Penalty %", value: $prepaymentPenaltyPercent)
+                    }
+                } header: {
+                    Text("Bank & Rate")
+                } footer: {
+                    if isFloatingRate {
+                        Text("Floating rates are linked to benchmarks (repo rate, SOFR, EURIBOR). Most countries prohibit prepayment penalties on floating-rate home loans.")
+                    } else {
+                        Text("Fixed-rate loans may carry a prepayment penalty (typically 2-5% of prepaid amount). Check your loan agreement.")
+                    }
+                }
+
+                Section {
                     numberRow("EMIs Paid", value: $elapsedMonths)
                     numberRow("Total Paid So Far", value: $paidBeforeTracking)
                 } header: {
@@ -1351,6 +1772,25 @@ struct LoanFormView: View {
                     Button("Save", action: save).disabled(!isValid)
                 }
             }
+            .sheet(isPresented: $showingTemplatePicker) {
+                BankTemplatePicker { template in
+                    applyTemplate(template)
+                }
+            }
+        }
+    }
+
+    private func applyTemplate(_ template: BankLoanTemplate) {
+        bankName = template.bankName
+        selectedCurrency = SupportedCurrency(rawValue: template.currencyCode) ?? selectedCurrency
+        isFloatingRate = template.isFloatingRate
+        prepaymentPenaltyPercent = template.prepaymentPenaltyPercent
+        ratePercent = (template.typicalRateMin + template.typicalRateMax) / 2.0 * 100
+        selectedIcon = LoanIcon(rawValue: template.loanType.iconKey) ?? .generic
+        if template.maxTenureMonths > 0 {
+            let (tv, tu) = Self.splitTenure(template.maxTenureMonths)
+            tenureValue = tv
+            tenureUnit = tu
         }
     }
 
@@ -1403,6 +1843,10 @@ struct LoanFormView: View {
             existing.emiDay = derivedEMIDay
             existing.firstEMIDate = firstEMIDate
             existing.iconKey = selectedIcon.rawValue
+            existing.currencyCode = selectedCurrency.rawValue
+            existing.isFloatingRate = isFloatingRate
+            existing.prepaymentPenaltyPercent = prepaymentPenaltyPercent
+            existing.bankName = bankName
         } else {
             let loan = Loan(
                 name: name,
@@ -1416,7 +1860,11 @@ struct LoanFormView: View {
                 tenureMonths: tenureInMonths,
                 emiDay: derivedEMIDay,
                 firstEMIDate: firstEMIDate,
-                iconKey: selectedIcon.rawValue
+                iconKey: selectedIcon.rawValue,
+                currencyCode: selectedCurrency.rawValue,
+                isFloatingRate: isFloatingRate,
+                prepaymentPenaltyPercent: prepaymentPenaltyPercent,
+                bankName: bankName
             )
             context.insert(loan)
         }
@@ -1441,6 +1889,9 @@ struct AddPaymentView: View {
     @State private var amount: Double = 0
     @State private var date: Date = .now
     @State private var note: String = ""
+    @State private var paymentType: PaymentType = .emi
+    @State private var showingCelebration = false
+    @State private var celebrationLoan: Loan?
 
     var body: some View {
         NavigationStack {
@@ -1454,6 +1905,13 @@ struct AddPaymentView: View {
                     }
                 }
                 Section("Payment") {
+                    Picker("Type", selection: $paymentType) {
+                        ForEach(PaymentType.allCases) { type in
+                            Text(type.label).tag(type)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
                     HStack {
                         Text("Amount")
                         Spacer()
@@ -1461,6 +1919,21 @@ struct AddPaymentView: View {
                     }
                     DatePicker("Date", selection: $date, displayedComponents: .date)
                     TextField("Note (optional)", text: $note)
+
+                    // Show penalty warning for prepayments on loans with penalty
+                    if paymentType == .prepayment,
+                       let loan = selectedLoan,
+                       loan.prepaymentPenaltyPercent > 0,
+                       amount > 0 {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                            let penalty = amount * loan.prepaymentPenaltyPercent / 100
+                            Text("Penalty: \(penalty, format: .currency(code: loan.currencyCode).precision(.fractionLength(0)))")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
                 }
             }
             .navigationTitle("Add Payment")
@@ -1477,6 +1950,19 @@ struct AddPaymentView: View {
                 if selectedLoan == nil { selectedLoan = preselected ?? loans.first }
                 if amount == 0, defaultAmount > 0 { amount = defaultAmount }
             }
+            .fullScreenCover(isPresented: $showingCelebration) {
+                if let loan = celebrationLoan {
+                    LoanCelebrationView(
+                        loanName: loan.name,
+                        totalPaid: loan.payments.reduce(0) { $0 + $1.amount },
+                        currencyCode: loan.currencyCode,
+                        onDismiss: {
+                            showingCelebration = false
+                            dismiss()
+                        }
+                    )
+                }
+            }
         }
     }
 
@@ -1484,12 +1970,19 @@ struct AddPaymentView: View {
 
     private func save() {
         guard let loan = selectedLoan else { return }
-        let payment = Payment(amount: amount, date: date, note: note.isEmpty ? nil : note)
-        payment.loan = loan
+        let payment = Payment(amount: amount, date: date, note: note.isEmpty ? nil : note, type: paymentType)
+        loan.payments.append(payment)
         context.insert(payment)
         try? context.save()
         refreshAppState()
-        dismiss()
+
+        // Check if loan is now fully paid off
+        if loan.remainingBalance <= 0.01 {
+            celebrationLoan = loan
+            showingCelebration = true
+        } else {
+            dismiss()
+        }
     }
 }
 
@@ -1497,21 +1990,18 @@ struct AddPaymentView: View {
 
 /// Text field for monetary/numeric input.
 /// - Shows empty placeholder when the bound value is 0
-/// - Formats with Indian-style grouping (1,25,000) live as the user types
+/// - Formats with locale-aware digit grouping live as the user types
 /// - Accepts decimals via the decimal-pad keyboard (e.g. 8.5 for interest rate)
 struct FormattedAmountField: View {
     @Binding var value: Double
     @State private var text: String = ""
 
-    /// Explicit Indian grouping: groups of 3 then 2 thereafter.
-    /// (Locale alone doesn't always activate this — set sizes explicitly.)
+    /// Locale-aware grouping — uses the user's system settings for digit
+    /// grouping (e.g. 1,25,000 for en_IN; 125,000 for en_US; 125.000 for de_DE).
     private static let formatter: NumberFormatter = {
         let nf = NumberFormatter()
         nf.numberStyle = .decimal
-        nf.groupingSize = 3
-        nf.secondaryGroupingSize = 2
         nf.usesGroupingSeparator = true
-        nf.groupingSeparator = ","
         nf.maximumFractionDigits = 2
         return nf
     }()
@@ -1565,7 +2055,7 @@ struct FormattedAmountField: View {
             let display = "\(formattedWhole).\(parts[1])"
             if display != input { text = display }
         } else {
-            // Whole number — apply Indian grouping
+            // Whole number — apply locale grouping
             let display = Self.formatter.string(from: NSNumber(value: parsed)) ?? cleaned
             if display != input { text = display }
         }
@@ -1583,6 +2073,7 @@ struct ExportBackupSheet: View {
     @State private var preparedData: Data?
     @State private var showingFileExporter = false
     @State private var errorMessage: String?
+    @State private var isProcessing = false
 
     private var passphraseValid: Bool {
         passphrase.count >= 4 && passphrase == confirmPassphrase
@@ -1591,6 +2082,26 @@ struct ExportBackupSheet: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("Backup Summary") {
+                    HStack {
+                        Label("Loans", systemImage: "building.columns")
+                        Spacer()
+                        Text("\(loans.count)").foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Label("Payments", systemImage: "banknote")
+                        Spacer()
+                        let totalPayments = loans.reduce(0) { $0 + $1.payments.count }
+                        Text("\(totalPayments)").foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Label("Rate Changes", systemImage: "chart.line.uptrend.xyaxis")
+                        Spacer()
+                        let totalRC = loans.reduce(0) { $0 + $1.rateChanges.count }
+                        Text("\(totalRC)").foregroundStyle(.secondary)
+                    }
+                }
+
                 Section {
                     Text("Your backup file is encrypted with this passphrase. You'll need the exact same passphrase to restore it later.")
                         .font(.callout)
@@ -1629,9 +2140,25 @@ struct ExportBackupSheet: View {
                     Button("Export") {
                         prepareAndExport()
                     }
-                    .disabled(!passphraseValid)
+                    .disabled(!passphraseValid || isProcessing)
                 }
             }
+            .overlay {
+                if isProcessing {
+                    ZStack {
+                        Color.black.opacity(0.3).ignoresSafeArea()
+                        VStack(spacing: 16) {
+                            ProgressView()
+                                .scaleEffect(1.5)
+                            Text("Encrypting backup…")
+                                .font(.headline)
+                        }
+                        .padding(32)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    }
+                }
+            }
+            .allowsHitTesting(!isProcessing)
             .fileExporter(
                 isPresented: $showingFileExporter,
                 document: EncryptedBackupDocument(data: preparedData ?? Data()),
@@ -1653,12 +2180,24 @@ struct ExportBackupSheet: View {
     }
 
     private func prepareAndExport() {
-        do {
-            preparedData = try BackupManager.exportData(loans: loans, passphrase: passphrase)
-            errorMessage = nil
-            showingFileExporter = true
-        } catch {
-            errorMessage = "Could not prepare backup: \(error.localizedDescription)"
+        isProcessing = true
+        let loansSnapshot = loans
+        let pass = passphrase
+        Task.detached {
+            do {
+                let data = try BackupManager.exportData(loans: loansSnapshot, passphrase: pass)
+                await MainActor.run {
+                    preparedData = data
+                    errorMessage = nil
+                    isProcessing = false
+                    showingFileExporter = true
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = "Could not prepare backup: \(error.localizedDescription)"
+                    isProcessing = false
+                }
+            }
         }
     }
 }
@@ -1676,6 +2215,8 @@ struct ImportBackupSheet: View {
     @State private var previewedLoans: [LoanBackupDTO] = []
     @State private var stage: Stage = .pickingFile
     @State private var errorMessage: String?
+    @State private var isProcessing = false
+    @State private var processingMessage = ""
 
     enum Stage {
         case pickingFile, enteringPassphrase, confirmingReplace
@@ -1724,6 +2265,25 @@ struct ImportBackupSheet: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+                    Section("Backup Contents") {
+                        HStack {
+                            Label("Loans", systemImage: "building.columns")
+                            Spacer()
+                            Text("\(previewedLoans.count)").foregroundStyle(.secondary)
+                        }
+                        HStack {
+                            Label("Payments", systemImage: "banknote")
+                            Spacer()
+                            let totalPayments = previewedLoans.reduce(0) { $0 + $1.payments.count }
+                            Text("\(totalPayments)").foregroundStyle(.secondary)
+                        }
+                        HStack {
+                            Label("Rate Changes", systemImage: "chart.line.uptrend.xyaxis")
+                            Spacer()
+                            let totalRC = previewedLoans.reduce(0) { $0 + ($1.rateChanges?.count ?? 0) }
+                            Text("\(totalRC)").foregroundStyle(.secondary)
+                        }
+                    }
                     Section("Will restore") {
                         ForEach(previewedLoans, id: \.id) { loan in
                             HStack {
@@ -1748,6 +2308,7 @@ struct ImportBackupSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
+                        .disabled(isProcessing)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     switch stage {
@@ -1755,13 +2316,30 @@ struct ImportBackupSheet: View {
                         EmptyView()
                     case .enteringPassphrase:
                         Button("Decrypt") { tryDecrypt() }
-                            .disabled(passphrase.isEmpty)
+                            .disabled(passphrase.isEmpty || isProcessing)
                     case .confirmingReplace:
                         Button("Restore") { performRestore() }
                             .foregroundStyle(.red)
+                            .disabled(isProcessing)
                     }
                 }
             }
+            .overlay {
+                if isProcessing {
+                    ZStack {
+                        Color.black.opacity(0.3).ignoresSafeArea()
+                        VStack(spacing: 16) {
+                            ProgressView()
+                                .scaleEffect(1.5)
+                            Text(processingMessage)
+                                .font(.headline)
+                        }
+                        .padding(32)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    }
+                }
+            }
+            .allowsHitTesting(!isProcessing)
             .fileImporter(
                 isPresented: $showingFilePicker,
                 allowedContentTypes: [.json],
@@ -1792,23 +2370,41 @@ struct ImportBackupSheet: View {
 
     private func tryDecrypt() {
         guard let fileData else { return }
-        do {
-            let loans = try BackupManager.previewImport(fileData: fileData, passphrase: passphrase)
-            previewedLoans = loans
-            stage = .confirmingReplace
-            errorMessage = nil
-        } catch {
-            errorMessage = error.localizedDescription
+        isProcessing = true
+        processingMessage = "Decrypting…"
+        let pass = passphrase
+        Task.detached {
+            do {
+                let loans = try BackupManager.previewImport(fileData: fileData, passphrase: pass)
+                await MainActor.run {
+                    previewedLoans = loans
+                    stage = .confirmingReplace
+                    errorMessage = nil
+                    isProcessing = false
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = error.localizedDescription
+                    isProcessing = false
+                }
+            }
         }
     }
 
     private func performRestore() {
-        do {
-            try BackupManager.restore(loans: previewedLoans, context: context)
-            refreshAppState()
-            dismiss()
-        } catch {
-            errorMessage = "Restore failed: \(error.localizedDescription)"
+        isProcessing = true
+        processingMessage = "Restoring data…"
+        let dtos = previewedLoans
+        Task {
+            do {
+                try BackupManager.restore(loans: dtos, context: context)
+                refreshAppState()
+                isProcessing = false
+                dismiss()
+            } catch {
+                errorMessage = "Restore failed: \(error.localizedDescription)"
+                isProcessing = false
+            }
         }
     }
 }

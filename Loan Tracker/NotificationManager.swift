@@ -12,6 +12,7 @@ struct ReminderTarget {
     let remainingBalance: Double
     let nextEMIDate: Date?
     let emiDay: Int
+    let currencyCode: String
 }
 
 // MARK: - Preferences (UserDefaults-backed; readable by sync code)
@@ -233,7 +234,7 @@ enum NotificationManager {
     }
 
     private static func makeBody(loan: ReminderTarget, daysBefore: Int) -> String {
-        let amount = loan.monthlyPayment.formatted(.currency(code: "INR").precision(.fractionLength(0)))
+        let amount = loan.monthlyPayment.formatted(.currency(code: loan.currencyCode).precision(.fractionLength(0)))
         switch daysBefore {
         case 0:  return "\(loan.name) — \(amount) is due today."
         case 1:  return "\(loan.name) — \(amount) is due tomorrow."
@@ -254,7 +255,8 @@ func refreshNotifications(loans: [Loan]) {
             monthlyPayment: loan.monthlyPayment,
             remainingBalance: loan.remainingBalance,
             nextEMIDate: loan.nextEMIDate,
-            emiDay: loan.emiDay
+            emiDay: loan.emiDay,
+            currencyCode: loan.currencyCode
         )
     }
     Task {

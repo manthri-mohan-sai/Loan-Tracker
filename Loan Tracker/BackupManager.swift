@@ -23,11 +23,25 @@ struct LoanBackupDTO: Codable {
     let firstEMIDate: Date?
     let createdAt: Date
     let payments: [PaymentBackupDTO]
+
+    // v2 fields — optional so v1 backups still decode cleanly
+    let currencyCode: String?
+    let isFloatingRate: Bool?
+    let prepaymentPenaltyPercent: Double?
+    let bankName: String?
+    let rateChanges: [RateChangeBackupDTO]?
 }
 
 struct PaymentBackupDTO: Codable {
     let amount: Double
     let date: Date
+    let note: String?
+    let type: String?   // "emi" or "prepayment"; nil = legacy EMI
+}
+
+struct RateChangeBackupDTO: Codable {
+    let effectiveDate: Date
+    let newAnnualRate: Double
     let note: String?
 }
 
@@ -136,12 +150,19 @@ enum BackupManager {
                 firstEMIDate: loan.firstEMIDate,
                 createdAt: loan.createdAt,
                 payments: loan.payments.map {
-                    PaymentBackupDTO(amount: $0.amount, date: $0.date, note: $0.note)
+                    PaymentBackupDTO(amount: $0.amount, date: $0.date, note: $0.note, type: $0.type)
+                },
+                currencyCode: loan.currencyCode,
+                isFloatingRate: loan.isFloatingRate,
+                prepaymentPenaltyPercent: loan.prepaymentPenaltyPercent,
+                bankName: loan.bankName,
+                rateChanges: loan.rateChanges.map {
+                    RateChangeBackupDTO(effectiveDate: $0.effectiveDate, newAnnualRate: $0.newAnnualRate, note: $0.note)
                 }
             )
         }
 
-        let contents = BackupContents(version: 1, loans: dtos)
+        let contents = BackupContents(version: 2, loans: dtos)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
@@ -185,10 +206,11 @@ enum BackupManager {
     @MainActor
     static func restore(loans dtos: [LoanBackupDTO], context: ModelContext) throws {
         // 1. Delete everything currently in the store.
+        try context.delete(model: RateChange.self)
         try context.delete(model: Payment.self)
         try context.delete(model: Loan.self)
 
-        // 2. Insert restored loans + their payments.
+        // 2. Insert restored loans + their payments and rate changes.
         for dto in dtos {
             let loan = Loan(
                 name: dto.name,
@@ -201,7 +223,11 @@ enum BackupManager {
                 startDate: dto.startDate,
                 tenureMonths: dto.tenureMonths,
                 emiDay: dto.emiDay,
-                firstEMIDate: dto.firstEMIDate
+                firstEMIDate: dto.firstEMIDate,
+                currencyCode: dto.currencyCode ?? "INR",
+                isFloatingRate: dto.isFloatingRate ?? true,
+                prepaymentPenaltyPercent: dto.prepaymentPenaltyPercent ?? 0,
+                bankName: dto.bankName ?? ""
             )
             // Preserve the original id if it's a valid UUID, so widget configurations
             // pinned to specific loans keep working after restore.
@@ -212,11 +238,20 @@ enum BackupManager {
             loan.createdAt = dto.createdAt
 
             context.insert(loan)
+
             for p in dto.payments {
-                let payment = Payment(amount: p.amount, date: p.date, note: p.note)
+                let paymentType = PaymentType(rawValue: p.type ?? PaymentType.emi.rawValue) ?? .emi
+                let payment = Payment(amount: p.amount, date: p.date, note: p.note, type: paymentType)
                 payment.loan = loan
                 loan.payments.append(payment)
                 context.insert(payment)
+            }
+
+            for rc in dto.rateChanges ?? [] {
+                let rateChange = RateChange(effectiveDate: rc.effectiveDate, newAnnualRate: rc.newAnnualRate, note: rc.note)
+                rateChange.loan = loan
+                loan.rateChanges.append(rateChange)
+                context.insert(rateChange)
             }
         }
 

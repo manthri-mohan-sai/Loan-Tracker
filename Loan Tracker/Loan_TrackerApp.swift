@@ -18,7 +18,7 @@ struct LoanTrackerApp: App {
 
     /// Shared SwiftData store so the widget can read the same data the app writes.
     let sharedContainer: ModelContainer = {
-        let schema = Schema([Loan.self, Payment.self])
+        let schema = Schema([Loan.self, Payment.self, RateChange.self, StoredDocument.self])
         let config = ModelConfiguration(
             "LoanTracker",
             schema: schema,
@@ -32,17 +32,22 @@ struct LoanTrackerApp: App {
     }()
 
     @State private var deepLinkRoute: DeepLinkRoute?
+    @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
 
     var body: some Scene {
         WindowGroup {
-            SplashGate {
-                HomeView(deepLinkRoute: $deepLinkRoute)
-                    .onOpenURL { url in
-                        print("📨 onOpenURL fired with: \(url.absoluteString)")
-                        let route = DeepLinkRoute(url: url)
-                        print("📨 Parsed route: \(String(describing: route))")
-                        deepLinkRoute = route
+            if hasCompletedOnboarding {
+                BiometricGate {
+                    SplashGate {
+                        HomeView(deepLinkRoute: $deepLinkRoute)
+                            .onOpenURL { url in
+                                let route = DeepLinkRoute(url: url)
+                                deepLinkRoute = route
+                            }
                     }
+                }
+            } else {
+                OnboardingView(isComplete: $hasCompletedOnboarding)
             }
         }
         .modelContainer(sharedContainer)
@@ -55,15 +60,23 @@ struct LoanTrackerApp: App {
 enum DeepLinkRoute: Identifiable, Equatable {
     case addPayment
     case addLoan
+    case importDocument(URL)
 
     var id: String {
         switch self {
         case .addPayment: return "addPayment"
         case .addLoan:    return "addLoan"
+        case .importDocument: return "importDocument"
         }
     }
 
     init?(url: URL) {
+        // Handle file:// URLs — shared PDFs/images from other apps
+        if url.isFileURL {
+            self = .importDocument(url)
+            return
+        }
+
         guard url.scheme == "loantracker" else {
             print("⚠️ URL scheme mismatch: \(url.scheme ?? "nil")")
             return nil
@@ -90,7 +103,7 @@ func refreshWidget() {
 @MainActor
 func refreshAppState() {
     refreshWidget()
-    let schema = Schema([Loan.self, Payment.self])
+    let schema = Schema([Loan.self, Payment.self, RateChange.self, StoredDocument.self])
     let config = ModelConfiguration(
         "LoanTracker",
         schema: schema,
