@@ -53,6 +53,7 @@ struct DocumentReviewView: View {
         case .referenceOnly:
             ReferenceOnlyView(
                 documentType: result.documentType,
+                markdownText: result.markdownText,
                 onDismiss: onDismiss
             )
         }
@@ -371,7 +372,10 @@ struct StatementReviewView: View {
 /// (insurance policies, collateral docs, interest certificates).
 struct ReferenceOnlyView: View {
     let documentType: LoanDocumentType
+    let markdownText: String?
     let onDismiss: () -> Void
+
+    @State private var showingMarkdown = false
 
     var body: some View {
         NavigationStack {
@@ -391,6 +395,15 @@ struct ReferenceOnlyView: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 32)
 
+                if let markdownText, !markdownText.isEmpty {
+                    Button {
+                        showingMarkdown = true
+                    } label: {
+                        Label("View Markdown", systemImage: "doc.plaintext")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+
                 Spacer()
             }
             .navigationTitle("Document")
@@ -398,6 +411,41 @@ struct ReferenceOnlyView: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { onDismiss() }
+                }
+            }
+            .sheet(isPresented: $showingMarkdown) {
+                if let markdownText {
+                    MarkdownPreviewView(markdownText: markdownText)
+                }
+            }
+        }
+    }
+}
+
+private struct MarkdownPreviewView: View {
+    let markdownText: String
+
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                Text(markdownText)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .font(.system(.body, design: .monospaced))
+                    .padding()
+            }
+            .navigationTitle("Markdown")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    ShareLink(item: markdownText) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
                 }
             }
         }

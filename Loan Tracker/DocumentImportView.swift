@@ -16,6 +16,7 @@ struct DocumentImportView: View {
     @State private var showingFilePicker = false
     @State private var scannedImages: [UIImage] = []
     @State private var ocrText: String = ""
+    @State private var markdownText: String = ""
     @State private var extractionResult: DocumentExtractionResult?
     @State private var isProcessing = false
     @State private var processingStep: String = ""
@@ -206,6 +207,7 @@ struct DocumentImportView: View {
     private func startPipelineFromImages(_ images: [UIImage]) {
         stage = .processing
         processingStep = "Recognizing text…"
+        markdownText = ""
 
         Task {
             do {
@@ -227,8 +229,16 @@ struct DocumentImportView: View {
                 let didStart = url.startAccessingSecurityScopedResource()
                 defer { if didStart { url.stopAccessingSecurityScopedResource() } }
 
-                let text = try await OCRService.extractText(from: url)
-                ocrText = text
+                if url.pathExtension.lowercased() == "pdf" {
+                    processingStep = "Converting PDF to markdown…"
+                    let conversion = try await MarkdownConvertion.convertPDF(at: url)
+                    ocrText = conversion.rawText
+                    markdownText = conversion.markdownText
+                } else {
+                    let text = try await OCRService.extractText(from: url)
+                    ocrText = text
+                    markdownText = ""
+                }
                 await runExtraction()
             } catch {
                 errorMessage = error.localizedDescription
@@ -260,7 +270,10 @@ struct DocumentImportView: View {
         }
 
         do {
-            let result = try await extractor.classifyAndExtract(ocrText: ocrText)
+            let result = try await extractor.classifyAndExtract(
+                ocrText: ocrText,
+                markdownText: markdownText.isEmpty ? nil : markdownText
+            )
 
             extractionResult = result
             stage = .reviewing
@@ -270,7 +283,10 @@ struct DocumentImportView: View {
                 let fallback = RegexExtractor()
                 do {
                     processingStep = "Retrying with pattern matching…"
-                    let result = try await fallback.classifyAndExtract(ocrText: ocrText)
+                    let result = try await fallback.classifyAndExtract(
+                        ocrText: ocrText,
+                        markdownText: markdownText.isEmpty ? nil : markdownText
+                    )
                     extractionResult = result
                     stage = .reviewing
                     return

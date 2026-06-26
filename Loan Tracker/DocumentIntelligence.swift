@@ -170,6 +170,7 @@ struct DocumentExtractionResult {
     let documentType: LoanDocumentType
     let fields: ExtractedFields
     let ocrText: String
+    let markdownText: String?
 }
 
 // MARK: - Extraction Protocol
@@ -185,7 +186,7 @@ protocol DocumentExtractor: Sendable {
 
 extension DocumentExtractor {
     /// Convenience: classify then extract appropriate fields.
-    func classifyAndExtract(ocrText: String) async throws -> DocumentExtractionResult {
+    func classifyAndExtract(ocrText: String, markdownText: String? = nil) async throws -> DocumentExtractionResult {
         let classification = try await classify(ocrText: ocrText)
 
         let fields: ExtractedFields
@@ -203,7 +204,8 @@ extension DocumentExtractor {
         return DocumentExtractionResult(
             documentType: classification.documentType,
             fields: fields,
-            ocrText: ocrText
+            ocrText: ocrText,
+            markdownText: markdownText
         )
     }
 }
