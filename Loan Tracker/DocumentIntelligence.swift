@@ -189,14 +189,17 @@ extension DocumentExtractor {
     func classifyAndExtract(ocrText: String, markdownText: String? = nil) async throws -> DocumentExtractionResult {
         let classification = try await classify(ocrText: ocrText)
 
+        // Prefer structured markdown (has <emi_table> tags) over raw OCR when available.
+        let textForExtraction = markdownText ?? ocrText
+
         let fields: ExtractedFields
         switch classification.documentType {
         case .sanctionLetter, .loanAgreement, .disbursementLetter:
-            fields = .loanCreation(try await extractLoanCreation(ocrText: ocrText))
+            fields = .loanCreation(try await extractLoanCreation(ocrText: textForExtraction))
         case .rateChangeLetter, .restructuringAgreement:
-            fields = .rateChange(try await extractRateChange(ocrText: ocrText))
+            fields = .rateChange(try await extractRateChange(ocrText: textForExtraction))
         case .loanStatement:
-            fields = .loanStatement(try await extractStatement(ocrText: ocrText))
+            fields = .loanStatement(try await extractStatement(ocrText: textForExtraction))
         default:
             fields = .referenceOnly
         }
@@ -786,26 +789,176 @@ struct RegexExtractor: DocumentExtractor {
 
 // MARK: - CoreML Fallback Implementation
 
-/// Uses a downloaded CoreML model for document extraction on devices
-/// without Apple Intelligence.
+/// Uses a locally downloaded Qwen model (CoreML) for document extraction
+/// on devices without Apple Intelligence.
+/// Requires iOS 18+ for stateful KV-cache inference.
 struct CoreMLExtractor: DocumentExtractor {
     let modelURL: URL
 
+    // MARK: - Classify
+
     func classify(ocrText: String) async throws -> DocumentClassificationResult {
-        // TODO: Load CoreML model, tokenize, run prediction
-        throw ExtractionError.modelNotAvailable
+        try await ensureLoaded()
+
+        let system = """
+            You are a loan document classifier.
+            Reply with ONLY a JSON object: {"documentType": "<value>"}
+            where <value> is exactly one of:
+            sanctionLetter, loanAgreement, disbursementLetter, loanStatement,
+            amortizationSchedule, rateChangeLetter, interestCertificate,
+            closureLetter, insurancePolicy, collateralDocument, restructuringAgreement, unknown
+            No extra text. No markdown fences.
+            """
+        let user = String(ocrText.prefix(1500))
+        let raw = try await LocalLLMService.shared.generate(
+            system: system, user: user, maxNewTokens: 64
+        )
+        let json = extractFirstJSON(from: raw)
+        guard
+            let data    = json.data(using: .utf8),
+            let obj     = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let typeStr = obj["documentType"] as? String
+        else {
+            return DocumentClassificationResult(documentType: .unknown,
+                                               reasoning: "CoreML parse failed: \(raw.prefix(80))")
+        }
+        let docType = LoanDocumentType(rawValue: typeStr) ?? .unknown
+        return DocumentClassificationResult(documentType: docType,
+                                            reasoning: "Qwen on-device")
     }
+
+    // MARK: - Extract Loan Creation
 
     func extractLoanCreation(ocrText: String) async throws -> LoanCreationFields {
-        throw ExtractionError.modelNotAvailable
+        try await ensureLoaded()
+
+        let system = """
+            Extract loan fields from this document.
+            Return ONLY valid JSON — no markdown, no extra text — with these exact keys:
+            loanName (string), principalAmount (number), annualInterestRatePercent (number),
+            monthlyEMI (number), tenureMonths (integer), startDate (YYYY-MM-DD string),
+            emiDay (integer 1-31), bankName (string), rateType (\"fixed\" or \"floating\"),
+            prepaymentPenaltyPercent (number), currencyCode (ISO 4217 string).
+            Use 0 for unknown numbers, empty string for unknown text fields.
+            """
+        let user = String(ocrText.prefix(3000))
+        let raw = try await LocalLLMService.shared.generate(
+            system: system, user: user, maxNewTokens: 350
+        )
+        return try parseLoanCreationFields(from: raw)
     }
+
+    // MARK: - Extract Rate Change
 
     func extractRateChange(ocrText: String) async throws -> RateChangeFields {
-        throw ExtractionError.modelNotAvailable
+        try await ensureLoaded()
+
+        let system = """
+            Extract rate change fields from this bank letter.
+            Return ONLY valid JSON with these exact keys:
+            newRatePercent (number), effectiveDate (YYYY-MM-DD string),
+            previousRatePercent (number), reason (string), bankName (string).
+            Use 0 for unknown numbers, empty string for unknown text.
+            """
+        let user = String(ocrText.prefix(2000))
+        let raw = try await LocalLLMService.shared.generate(
+            system: system, user: user, maxNewTokens: 150
+        )
+        return try parseRateChangeFields(from: raw)
     }
 
+    // MARK: - Extract Statement
+
     func extractStatement(ocrText: String) async throws -> LoanStatementFields {
-        throw ExtractionError.modelNotAvailable
+        try await ensureLoaded()
+
+        let system = """
+            Extract loan statement fields from this document.
+            Return ONLY valid JSON with these exact keys:
+            outstandingBalance (number), statementDate (YYYY-MM-DD string),
+            emisPaid (integer), totalInterestPaid (number), bankName (string).
+            Use 0 for unknown numbers, empty string for unknown text.
+            """
+        let user = String(ocrText.prefix(2000))
+        let raw = try await LocalLLMService.shared.generate(
+            system: system, user: user, maxNewTokens: 150
+        )
+        return try parseStatementFields(from: raw)
+    }
+
+    // MARK: - Private Helpers
+
+    private func ensureLoaded() async throws {
+        if await !LocalLLMService.shared.isLoaded {
+            try await LocalLLMService.shared.load(from: modelURL)
+        }
+    }
+
+    /// Extracts the first JSON object found in raw model output.
+    /// Handles models that wrap output in ```json ... ``` fences.
+    private func extractFirstJSON(from text: String) -> String {
+        let stripped = text
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```",     with: "")
+        if let start = stripped.range(of: "{"),
+           let end   = stripped.range(of: "}", options: .backwards) {
+            return String(stripped[start.lowerBound...end.upperBound])
+        }
+        return stripped
+    }
+
+    private func parseLoanCreationFields(from raw: String) throws -> LoanCreationFields {
+        let json = extractFirstJSON(from: raw)
+        guard
+            let data = json.data(using: .utf8),
+            let obj  = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { throw LLMError.jsonParseFailed(raw) }
+
+        return LoanCreationFields(
+            loanName:                  obj["loanName"]                  as? String ?? "Loan",
+            principalAmount:           obj["principalAmount"]           as? Double ?? 0,
+            annualInterestRatePercent: obj["annualInterestRatePercent"] as? Double ?? 0,
+            monthlyEMI:                obj["monthlyEMI"]                as? Double ?? 0,
+            tenureMonths:              obj["tenureMonths"]              as? Int    ?? 0,
+            startDate:                 obj["startDate"]                 as? String ?? "",
+            emiDay:                    obj["emiDay"]                    as? Int    ?? 0,
+            bankName:                  obj["bankName"]                  as? String ?? "",
+            rateType:                  obj["rateType"]                  as? String ?? "",
+            prepaymentPenaltyPercent:  obj["prepaymentPenaltyPercent"]  as? Double ?? 0,
+            currencyCode:              obj["currencyCode"]              as? String ?? ""
+        )
+    }
+
+    private func parseRateChangeFields(from raw: String) throws -> RateChangeFields {
+        let json = extractFirstJSON(from: raw)
+        guard
+            let data = json.data(using: .utf8),
+            let obj  = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { throw LLMError.jsonParseFailed(raw) }
+
+        return RateChangeFields(
+            newRatePercent:      obj["newRatePercent"]      as? Double ?? 0,
+            effectiveDate:       obj["effectiveDate"]       as? String ?? "",
+            previousRatePercent: obj["previousRatePercent"] as? Double ?? 0,
+            reason:              obj["reason"]              as? String ?? "",
+            bankName:            obj["bankName"]            as? String ?? ""
+        )
+    }
+
+    private func parseStatementFields(from raw: String) throws -> LoanStatementFields {
+        let json = extractFirstJSON(from: raw)
+        guard
+            let data = json.data(using: .utf8),
+            let obj  = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { throw LLMError.jsonParseFailed(raw) }
+
+        return LoanStatementFields(
+            outstandingBalance: obj["outstandingBalance"] as? Double ?? 0,
+            statementDate:      obj["statementDate"]      as? String ?? "",
+            emisPaid:           obj["emisPaid"]           as? Int    ?? 0,
+            totalInterestPaid:  obj["totalInterestPaid"]  as? Double ?? 0,
+            bankName:           obj["bankName"]           as? String ?? ""
+        )
     }
 }
 
@@ -842,11 +995,12 @@ final class CoreMLModelManager {
     }
 
     var compiledModelURL: URL {
-        modelDirectory.appendingPathComponent("LoanDocExtractor.mlmodelc")
+        modelDirectory.appendingPathComponent("Qwen2.5-0.5B-Instruct.mlmodelc")
     }
 
-    /// Placeholder — replace with your actual CDN endpoint.
-    private let remoteModelURL = URL(string: "https://models.example.com/LoanDocExtractor.mlpackage.zip")!
+    /// Replace with the URL where you host the compiled CoreML model zip.
+    /// Community exports: search "qwen coreml" on huggingface.co
+    private let remoteModelURL = URL(string: "https://models.example.com/Qwen2.5-0.5B-Instruct.mlmodelc.zip")!
 
     private init() {
         if FileManager.default.fileExists(atPath: compiledModelURL.path) {
