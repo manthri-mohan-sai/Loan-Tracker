@@ -24,6 +24,7 @@ struct DocumentImportView: View {
 
     // Fallback
     @State private var showingManualEntry = false
+    @State private var isAwaitingUserMarkdownConfirmation = false
 
     /// Optional URL passed in when the app is opened with a shared file.
     var importedFileURL: URL?
@@ -34,6 +35,7 @@ struct DocumentImportView: View {
     enum ImportStage {
         case choosingSource
         case processing
+        case confirmingMarkdown
         case reviewing
     }
 
@@ -44,6 +46,8 @@ struct DocumentImportView: View {
                 sourcePickerView
             case .processing:
                 processingView
+            case .confirmingMarkdown:
+                markdownConfirmationView
             case .reviewing:
                 if let result = extractionResult {
                     DocumentReviewView(result: result, targetLoan: targetLoan, onDismiss: { dismiss() })
@@ -190,6 +194,49 @@ struct DocumentImportView: View {
         }
     }
 
+    private var markdownConfirmationView: some View {
+        NavigationStack {
+            VStack(spacing: 24) {
+                Spacer()
+
+                Text("Review Converted Text")
+                    .font(.title2.weight(.bold))
+
+                ScrollView {
+                    Text(markdownText)
+                        .font(.system(.body, design: .monospaced))
+                        .padding()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 300)
+                .background(Color(.systemGray6))
+                .cornerRadius(8)
+                .padding(.horizontal)
+
+                Text("Is the converted text correct? If not, you can cancel and try another method.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+
+                HStack(spacing: 16) {
+                    Button("Cancel") {
+                        stage = .choosingSource
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button("Continue") {
+                        continueAfterMarkdownConfirmation()
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                Spacer()
+            }
+            .navigationTitle("Converted Text")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+
     // MARK: - Pipeline
 
     private func handleFileImport(_ result: Result<[URL], Error>) {
@@ -231,15 +278,16 @@ struct DocumentImportView: View {
 
                 if url.pathExtension.lowercased() == "pdf" {
                     processingStep = "Converting PDF to markdown…"
-                    let conversion = try await MarkdownConvertion.convertPDF(at: url)
-                    ocrText = conversion.rawText
+                    let conversion = try await MarkdownConversion.convertPDF(at: url)
                     markdownText = conversion.markdownText
+                    ocrText = conversion.rawText
+                    stage = .confirmingMarkdown
                 } else {
                     let text = try await OCRService.extractText(from: url)
                     ocrText = text
                     markdownText = ""
+                    await runExtraction()
                 }
-                await runExtraction()
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -297,8 +345,14 @@ struct DocumentImportView: View {
             errorMessage = error.localizedDescription
         }
     }
+
+    private func continueAfterMarkdownConfirmation() {
+        stage = .processing
+        Task { await runExtraction() }
+    }
 }
 
 // MARK: - Private helpers
 
 private let NSUserCancelledError = 3072  // NSCocoaErrorDomain user cancelled code
+
