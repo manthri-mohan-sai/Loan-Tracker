@@ -1,6 +1,5 @@
 import Foundation
 import FoundationModels
-import CoreML
 
 // MARK: - Document Types
 
@@ -991,24 +990,28 @@ final class CoreMLModelManager {
 
     private var modelDirectory: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("MLModels", isDirectory: true)
+            .appendingPathComponent("LLMModels", isDirectory: true)
     }
 
-    var compiledModelURL: URL {
-        modelDirectory.appendingPathComponent("Qwen2.5-0.5B-Instruct.mlmodelc")
+    /// Path to the downloaded GGUF file.
+    var modelURL: URL {
+        modelDirectory.appendingPathComponent("Qwen2.5-0.5B-Instruct-Q4_K_M.gguf")
     }
 
-    /// Replace with the URL where you host the compiled CoreML model zip.
-    /// Community exports: search "qwen coreml" on huggingface.co
-    private let remoteModelURL = URL(string: "https://models.example.com/Qwen2.5-0.5B-Instruct.mlmodelc.zip")!
+    /// Direct HuggingFace download link for the GGUF model.
+    /// User must accept HF terms of use; the file is ~350 MB.
+    private let remoteModelURL = URL(string:
+        "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
+    )!
 
     private init() {
-        if FileManager.default.fileExists(atPath: compiledModelURL.path) {
+        if FileManager.default.fileExists(atPath: modelURL.path) {
             state = .downloaded
         }
     }
 
-    /// Download and compile the CoreML model.
+    /// Download the GGUF model file from HuggingFace.
+    /// No compilation step needed — GGUF loads directly via llama.cpp.
     func downloadModel() async {
         state = .downloading(progress: 0)
 
@@ -1017,14 +1020,11 @@ final class CoreMLModelManager {
 
             let (tempURL, _) = try await URLSession.shared.download(from: remoteModelURL)
 
-            // Compile the downloaded model
-            let compiledURL = try await MLModel.compileModel(at: tempURL)
-
-            // Move to permanent location
-            if FileManager.default.fileExists(atPath: compiledModelURL.path) {
-                try FileManager.default.removeItem(at: compiledModelURL)
+            // Move GGUF to permanent location
+            if FileManager.default.fileExists(atPath: modelURL.path) {
+                try FileManager.default.removeItem(at: modelURL)
             }
-            try FileManager.default.moveItem(at: compiledURL, to: compiledModelURL)
+            try FileManager.default.moveItem(at: tempURL, to: modelURL)
 
             state = .downloaded
         } catch {
@@ -1032,16 +1032,16 @@ final class CoreMLModelManager {
         }
     }
 
-    /// Delete the downloaded model to free disk space.
+    /// Delete the downloaded GGUF to free disk space.
     func deleteModel() {
-        try? FileManager.default.removeItem(at: compiledModelURL)
+        try? FileManager.default.removeItem(at: modelURL)
         state = .notDownloaded
     }
 
     /// Disk space used by the model in bytes, nil if not downloaded.
     var modelSizeOnDisk: Int64? {
         guard state == .downloaded else { return nil }
-        let attrs = try? FileManager.default.attributesOfItem(atPath: compiledModelURL.path)
+        let attrs = try? FileManager.default.attributesOfItem(atPath: modelURL.path)
         return attrs?[.size] as? Int64
     }
 }
@@ -1076,7 +1076,7 @@ enum DocumentExtractorFactory {
         case .appleIntelligence:
             return (FoundationModelsExtractor(), .appleIntelligence)
         case .downloadedModel:
-            return (CoreMLExtractor(modelURL: CoreMLModelManager.shared.compiledModelURL), .downloadedModel)
+            return (CoreMLExtractor(modelURL: CoreMLModelManager.shared.modelURL), .downloadedModel)
         case .regexFallback:
             return (RegexExtractor(), .regexFallback)
         }

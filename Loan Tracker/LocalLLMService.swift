@@ -1,16 +1,172 @@
 import Foundation
-import CoreML
+import llama
 
-// MARK: - Local LLM Service
+// MARK: - Local LLM Service (llama.cpp / GGUF)
 //
-// Non-stateful inference: feeds the full growing token sequence to the
-// model at every decode step and reads logits at the last position.
+// Runs GGUF models on-device using llama.cpp — no CoreML, no internet
+// connection required after the model file is downloaded.
 //
-// Compatible with iOS 16+ — no makeState() / MLState required.
+// ── Setup ────────────────────────────────────────────────────────────────────
+// 1. In Xcode: File → Add Package Dependencies
+//    https://github.com/ggml-org/llama.cpp
+//    (add the "llama" library target to "Loan Tracker")
 //
-// Model contract (produced by CoreML-Conversion/convert_qwen.py):
-//   Input  "input_ids"  shape [1, seq_len]         dtype int32
-//   Output "logits"     shape [1, seq_len, vocab]   dtype float16
+// 2. Recommended model (user downloads via Settings → Download Model):
+//    Qwen2.5-0.5B-Instruct-Q4_K_M.gguf  (~350 MB)
+//    https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF
+// ─────────────────────────────────────────────────────────────────────────────
+
+actor LocalLLMService {
+
+    // MARK: - Shared Instance
+
+    static let shared = LocalLLMService()
+
+    // MARK: - State
+
+    private var model:   OpaquePointer?   // llama_model *
+    private var context: OpaquePointer?   // llama_context *
+
+    var isLoaded: Bool { model != nil && context != nil }
+
+    // MARK: - Load
+
+    func load(from url: URL) throws {
+        // One-time backend init (safe to call repeatedly)
+        llama_backend_init()
+
+        // Load the GGUF weights
+        var modelParams = llama_model_default_params()
+        modelParams.n_gpu_layers = 0   // llama.cpp uses Metal internally on Apple hardware
+
+        guard let loadedModel = llama_load_model_from_file(url.path, modelParams) else {
+            throw LLMError.modelNotLoaded
+        }
+
+        // Create inference context
+        var ctxParams = llama_context_default_params()
+        ctxParams.n_ctx      = 1024   // token context window
+        ctxParams.n_batch    = 512    // prompt decode batch size
+        ctxParams.n_threads  = Int32(max(1, ProcessInfo.processInfo.activeProcessorCount - 1))
+        ctxParams.flash_attn = true   // faster attention on supported hardware
+
+        guard let ctx = llama_new_context_with_model(loadedModel, ctxParams) else {
+            llama_free_model(loadedModel)
+            throw LLMError.modelNotLoaded
+        }
+
+        self.model   = loadedModel
+        self.context = ctx
+    }
+
+    // MARK: - Unload
+
+    func unload() {
+        if let ctx = context { llama_free(ctx) }
+        if let mdl = model   { llama_free_model(mdl) }
+        context = nil
+        model   = nil
+    }
+
+    // MARK: - Generate
+
+    /// Runs the Qwen instruct chat template then generates up to maxNewTokens.
+    /// Returns the raw generated string (JSON in our case).
+    func generate(
+        system:        String,
+        user:          String,
+        maxNewTokens:  Int   = 300,
+        temperature:   Float = 0.0
+    ) async throws -> String {
+        guard let model, let context else { throw LLMError.modelNotLoaded }
+
+        // Qwen chat template
+        let prompt = "<|im_start|>system\n\(system)<|im_end|>\n" +
+                     "<|im_start|>user\n\(user)<|im_end|>\n" +
+                     "<|im_start|>assistant\n"
+
+        // ── Tokenize ─────────────────────────────────────────────────────
+        var promptTokens = [llama_token](repeating: 0, count: 2048)
+        let nRaw = llama_tokenize(
+            model, prompt, Int32(prompt.utf8.count),
+            &promptTokens, Int32(promptTokens.count),
+            true,   // add BOS
+            true    // parse special tokens (<|im_start|> etc.)
+        )
+        guard nRaw > 0 else { throw LLMError.emptyPrompt }
+
+        // Truncate to leave headroom for output (context = 1024)
+        let maxPromptTokens = 724
+        promptTokens = Array(promptTokens.prefix(Int(min(nRaw, Int32(maxPromptTokens)))))
+
+        // ── Prefill ───────────────────────────────────────────────────────
+        llama_kv_cache_clear(context)
+
+        let prefillResult = promptTokens.withUnsafeMutableBufferPointer { ptr in
+            llama_decode(context, llama_batch_get_one(ptr.baseAddress!, Int32(ptr.count)))
+        }
+        guard prefillResult == 0 else { throw LLMError.unexpectedOutputShape }
+
+        // ── Sampler setup ─────────────────────────────────────────────────
+        let chainParams = llama_sampler_chain_default_params()
+        guard let sampler = llama_sampler_chain_init(chainParams) else {
+            throw LLMError.modelNotLoaded
+        }
+        defer { llama_sampler_free(sampler) }
+
+        if temperature <= 0 {
+            llama_sampler_chain_add(sampler, llama_sampler_init_greedy())
+        } else {
+            llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature))
+            llama_sampler_chain_add(sampler, llama_sampler_init_dist(UInt32.random(in: 0...UInt32.max)))
+        }
+
+        // ── Decode loop ───────────────────────────────────────────────────
+        var output = ""
+
+        for _ in 0..<maxNewTokens {
+            var newToken = llama_sampler_sample(sampler, context, -1)
+            llama_sampler_accept(sampler, newToken)
+
+            if llama_token_is_eog(model, newToken) { break }
+
+            // Token ID → text piece
+            var piece = [CChar](repeating: 0, count: 256)
+            let pieceLen = llama_token_to_piece(model, newToken, &piece, 256, 0, false)
+            if pieceLen > 0 { output += String(cString: piece) }
+
+            // Feed token back into context
+            let stepResult = withUnsafeMutablePointer(to: &newToken) { ptr in
+                llama_decode(context, llama_batch_get_one(ptr, 1))
+            }
+            if stepResult != 0 { break }
+        }
+
+        return output
+    }
+}
+
+// MARK: - Errors
+
+enum LLMError: LocalizedError {
+    case modelNotLoaded
+    case emptyPrompt
+    case unexpectedOutputShape
+    case jsonParseFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .modelNotLoaded:
+            return "Local LLM model is not loaded. Download it from Settings."
+        case .emptyPrompt:
+            return "Tokenizer produced an empty prompt."
+        case .unexpectedOutputShape:
+            return "Model decoding failed — check context size or GGUF format."
+        case .jsonParseFailed(let raw):
+            return "Could not parse JSON from model output: \(raw.prefix(120))"
+        }
+    }
+}
 
 actor LocalLLMService {
 
