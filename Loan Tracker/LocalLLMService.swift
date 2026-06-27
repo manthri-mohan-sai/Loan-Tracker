@@ -68,10 +68,9 @@ actor LocalLLMService {
             modelPath: url.path,
             modelConfiguration: .init(
                 nCTX: 2048,
-                temperature: 0.7,       // greedy — best for JSON extraction
+                temperature: 0.1,       // near-greedy — best for deterministic JSON
                 maxTokenCount: 512,
-                stopTokens: []
-                
+                stopTokens: ["<|im_end|>"]
             )
         )
         currentModelURL = url
@@ -107,26 +106,24 @@ actor LocalLLMService {
         
         let truncatedUser = String(user.prefix(800))
         
-        // Alpaca uses plain text — no special tokens needed
-        // Embed system into the instruction directly
-        let fullInstruction = """
-            SYSTEM: \(system)
-            
-            USER: \(truncatedUser)
-            
-            ASSISTANT:
-            """
+        // Qwen2.5 is trained on ChatML format. We must use .chatML prompt type so
+        // SwiftLlama wraps the message in <|im_start|>user … <|im_end|> / <|im_start|>assistant.
+        //
+        // SwiftLlama 0.4.0's encodeChatMLPrompt() does NOT insert a system block, so
+        // the system instruction is embedded at the top of the user turn instead.
+        // This is valid ChatML for small instruction-tuned models.
+        let userTurn = "\(system)\n\n\(truncatedUser)"
         
         let prompt = Prompt(
-            type: .alpaca,
+            type: .chatML,
             systemPrompt: "",
-            userMessage: fullInstruction
+            userMessage: userTurn
         )
         
         var output = ""
         var tokenCount = 0
         
-        print("🤖 Starting generation with prompt length: \(fullInstruction.count)")
+        print("🤖 Starting generation with prompt length: \(userTurn.count)")
         
         for try await token in await swiftLlama.start(for: prompt, sessionSupport: false) {
             print("🔤 Token \(tokenCount): '\(token)'")

@@ -188,7 +188,8 @@ extension DocumentExtractor {
     func classifyAndExtract(ocrText: String, markdownText: String? = nil) async throws -> DocumentExtractionResult {
         let classification = try await classify(ocrText: ocrText)
 
-        // Prefer structured markdown (has <emi_table> tags) over raw OCR when available.
+        // Prefer markdown-converted text for PDFs (structured tables, clean layout).
+        // Falls back to raw OCR text for images or non-PDF inputs.
         let textForExtraction = markdownText ?? ocrText
 
         let fields: ExtractedFields
