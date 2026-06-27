@@ -961,90 +961,6 @@ struct CoreMLExtractor: DocumentExtractor {
     }
 }
 
-// MARK: - CoreML Model Manager
-
-/// Manages downloading, compiling, and storing a fallback CoreML model
-/// for devices without Apple Intelligence.
-@Observable
-final class CoreMLModelManager {
-    static let shared = CoreMLModelManager()
-
-    enum ModelState: Equatable {
-        case notDownloaded
-        case downloading(progress: Double)
-        case downloaded
-        case failed(String)
-
-        static func == (lhs: ModelState, rhs: ModelState) -> Bool {
-            switch (lhs, rhs) {
-            case (.notDownloaded, .notDownloaded): return true
-            case (.downloading(let a), .downloading(let b)): return a == b
-            case (.downloaded, .downloaded): return true
-            case (.failed(let a), .failed(let b)): return a == b
-            default: return false
-            }
-        }
-    }
-
-    private(set) var state: ModelState = .notDownloaded
-
-    private var modelDirectory: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("LLMModels", isDirectory: true)
-    }
-
-    /// Path to the downloaded GGUF file.
-    var modelURL: URL {
-        modelDirectory.appendingPathComponent("Qwen2.5-0.5B-Instruct-Q4_K_M.gguf")
-    }
-
-    /// Direct HuggingFace download link for the GGUF model.
-    /// User must accept HF terms of use; the file is ~350 MB.
-    private let remoteModelURL = URL(string:
-        "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
-    )!
-
-    private init() {
-        if FileManager.default.fileExists(atPath: modelURL.path) {
-            state = .downloaded
-        }
-    }
-
-    /// Download the GGUF model file from HuggingFace.
-    /// No compilation step needed — GGUF loads directly via llama.cpp.
-    func downloadModel() async {
-        state = .downloading(progress: 0)
-
-        do {
-            try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
-
-            let (tempURL, _) = try await URLSession.shared.download(from: remoteModelURL)
-
-            // Move GGUF to permanent location
-            if FileManager.default.fileExists(atPath: modelURL.path) {
-                try FileManager.default.removeItem(at: modelURL)
-            }
-            try FileManager.default.moveItem(at: tempURL, to: modelURL)
-
-            state = .downloaded
-        } catch {
-            state = .failed(error.localizedDescription)
-        }
-    }
-
-    /// Delete the downloaded GGUF to free disk space.
-    func deleteModel() {
-        try? FileManager.default.removeItem(at: modelURL)
-        state = .notDownloaded
-    }
-
-    /// Disk space used by the model in bytes, nil if not downloaded.
-    var modelSizeOnDisk: Int64? {
-        guard state == .downloaded else { return nil }
-        let attrs = try? FileManager.default.attributesOfItem(atPath: modelURL.path)
-        return attrs?[.size] as? Int64
-    }
-}
 
 // MARK: - Extractor Factory
 
@@ -1056,22 +972,28 @@ enum ExtractorAvailability {
 }
 
 enum DocumentExtractorFactory {
-
+  
     /// Check which extraction backend is available (best → worst).
     static func availability() -> ExtractorAvailability {
-        let model = SystemLanguageModel.default
-        if case .available = model.availability {
-            return .appleIntelligence
-        }
-        if CoreMLModelManager.shared.state == .downloaded {
-            return .downloadedModel
-        }
-        return .regexFallback
+        // TEMP: Force local GGUF model for on-device testing
+        // Uncomment original logic below when ready for production
+        return .downloadedModel
+
+        // Original logic:
+        // let model = SystemLanguageModel.default
+        // if case .available = model.availability {
+        //     return .appleIntelligence
+        // }
+        // if CoreMLModelManager.shared.state == .downloaded {
+        //     return .downloadedModel
+        // }
+        // return .regexFallback
     }
 
     /// Create the best available extractor. Always returns a valid extractor:
-    /// Apple Intelligence > CoreML > Regex fallback.
+    /// Apple Intelligence > Local GGUF > Regex fallback.
     static func makeExtractor() -> (extractor: DocumentExtractor, source: ExtractorAvailability) {
+       
         switch availability() {
         case .appleIntelligence:
             return (FoundationModelsExtractor(), .appleIntelligence)

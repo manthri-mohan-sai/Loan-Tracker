@@ -9,13 +9,10 @@ struct SettingsView: View {
     @Environment(\.modelContext) private var context
     @Query(sort: \Loan.createdAt) private var loans: [Loan]
 
-    // Bound to UserDefaults via @AppStorage so changes persist.
     @AppStorage("reminderEnabled")     private var reminderEnabled: Bool = false
     @AppStorage("reminderDaysBefore")  private var reminderDaysBefore: Int = 3
     @AppStorage("reminderHour")        private var reminderHour: Int = 9
     @AppStorage("reminderMinute")      private var reminderMinute: Int = 0
-    /// -1 sentinel = secondary alert off. Any value 0...7 = enabled at that days-before.
-    /// Using a sentinel rather than Optional since @AppStorage handles Int cleanly.
     @AppStorage("reminderSecondaryDaysBefore") private var reminderSecondaryDaysBefore: Int = -1
 
     @State private var authStatus: UNAuthorizationStatus = .notDetermined
@@ -23,6 +20,7 @@ struct SettingsView: View {
     @State private var showingImportSheet = false
     @State private var showingCSVExport = false
     @State private var showingPermissionAlert = false
+    @State private var showModelDownload = false
     @State private var biometricManager = BiometricLockManager.shared
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = true
     @AppStorage("defaultCurrency") private var defaultCurrency: String = Locale.current.currency?.identifier ?? "USD"
@@ -33,6 +31,7 @@ struct SettingsView: View {
                 notificationsSection
                 currencySection
                 securitySection
+                aiModelSection
                 dataSection
                 aboutSection
             }
@@ -51,6 +50,9 @@ struct SettingsView: View {
             }
             .sheet(isPresented: $showingCSVExport) {
                 CSVExportSheet(loans: loans)
+            }
+            .sheet(isPresented: $showModelDownload) {
+                ModelDownloadView()
             }
             .alert("Notifications Disabled", isPresented: $showingPermissionAlert) {
                 Button("Open Settings") {
@@ -90,8 +92,6 @@ struct SettingsView: View {
                     refreshNotifications(loans: loans)
                 }
 
-                // Optional second alert — useful for "remind me 3 days ahead AND
-                // again the day before" combinations.
                 Picker("Second Alert", selection: $reminderSecondaryDaysBefore) {
                     Text("Off").tag(-1)
                     Text("Same day").tag(0)
@@ -100,7 +100,6 @@ struct SettingsView: View {
                     Text("7 days before").tag(7)
                 }
                 .onChange(of: reminderSecondaryDaysBefore) { _, newValue in
-                    // Write through to ReminderPrefs as Optional Int
                     ReminderPrefs.secondaryDaysBefore = newValue >= 0 ? newValue : nil
                     refreshNotifications(loans: loans)
                 }
@@ -116,12 +115,6 @@ struct SettingsView: View {
                 .onChange(of: reminderMinute) { _, _ in
                     refreshNotifications(loans: loans)
                 }
-
-//                Button {
-//                    NotificationManager.sendTestNotification()
-//                } label: {
-//                    Label("Send Test Notification", systemImage: "bell.badge")
-//                }
             }
         } header: {
             Text("Notifications")
@@ -144,7 +137,6 @@ struct SettingsView: View {
 
     @State private var showCurrencyApplied = false
 
-    /// How many existing loans use a different currency than the default.
     private var loansMismatchingCurrency: Int {
         loans.filter { $0.currencyCode != defaultCurrency }.count
     }
@@ -194,7 +186,6 @@ struct SettingsView: View {
                 set: { newValue in
                     biometricManager.isEnabled = newValue
                     if newValue {
-                        // Verify biometrics work when enabling
                         Task { await biometricManager.authenticate() }
                     }
                 }
@@ -209,6 +200,61 @@ struct SettingsView: View {
                 Text("No biometric authentication is available on this device.")
             } else {
                 Text("Require \(biometricManager.biometricName) to open the app.")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var aiModelSection: some View {
+        Section {
+            HStack {
+                Label("On-Device AI", systemImage: "cpu")
+                Spacer()
+                switch CoreMLModelManager.shared.state {
+                case .notDownloaded:
+                    Text("Not Downloaded")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                case .downloading(let progress):
+                    Text("\(Int(progress * 100))%")
+                        .foregroundStyle(.secondary)
+                        .font(.caption.monospacedDigit())
+                case .downloaded:
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                case .failed:
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                }
+            }
+
+            Button {
+                showModelDownload = true
+            } label: {
+                switch CoreMLModelManager.shared.state {
+                case .notDownloaded:
+                    Label("Download AI Model (~350 MB)", systemImage: "arrow.down.circle")
+                case .downloading:
+                    Label("View Download Progress", systemImage: "arrow.down.circle")
+                case .downloaded:
+                    Label("Manage AI Model", systemImage: "cpu.fill")
+                case .failed:
+                    Label("Retry Download", systemImage: "arrow.clockwise")
+                }
+            }
+        } header: {
+            Text("AI Model")
+        } footer: {
+            switch CoreMLModelManager.shared.state {
+            case .notDownloaded:
+                Text("Download the on-device AI model to process loan documents privately. Requires WiFi.")
+            case .downloading(let progress):
+                Text("Downloading… \(CoreMLModelManager.shared.downloadedSizeString(progress: progress))")
+            case .downloaded:
+                Text("On-device AI is active. Documents are processed privately on your device.")
+            case .failed(let message):
+                Text("Download failed: \(message)")
+                    .foregroundStyle(.red)
             }
         }
     }
@@ -273,13 +319,11 @@ struct SettingsView: View {
         return date.formatted(date: .omitted, time: .shortened)
     }
 
-    /// "on the day" / "3 days before" — used in the footer summary.
     private func daysBeforeDescription(_ days: Int) -> String {
         if days == 0 { return "on the day" }
         return "\(days) day\(days == 1 ? "" : "s") before"
     }
 
-    /// Two-way binding that exposes hour+minute as a single Date for DatePicker.
     private var reminderTimeBinding: Binding<Date> {
         Binding(
             get: {
@@ -303,7 +347,6 @@ struct SettingsView: View {
             if granted {
                 refreshNotifications(loans: loans)
             } else {
-                // Reflect denial in the UI.
                 reminderEnabled = false
                 if authStatus == .denied {
                     showingPermissionAlert = true
