@@ -30,6 +30,9 @@ struct LoanBackupDTO: Codable {
     let prepaymentPenaltyPercent: Double?
     let bankName: String?
     let rateChanges: [RateChangeBackupDTO]?
+
+    // v3 field — optional so older backups still decode cleanly
+    let currentOutstandingAsOf: Date?
 }
 
 struct PaymentBackupDTO: Codable {
@@ -158,11 +161,12 @@ enum BackupManager {
                 bankName: loan.bankName,
                 rateChanges: loan.rateChanges.map {
                     RateChangeBackupDTO(effectiveDate: $0.effectiveDate, newAnnualRate: $0.newAnnualRate, note: $0.note)
-                }
+                },
+                currentOutstandingAsOf: loan.currentOutstandingAsOf
             )
         }
 
-        let contents = BackupContents(version: 2, loans: dtos)
+        let contents = BackupContents(version: 3, loans: dtos)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
@@ -220,6 +224,7 @@ enum BackupManager {
                 elapsedMonths: dto.elapsedMonths,
                 paidBeforeTracking: dto.paidBeforeTracking,
                 currentOutstanding: dto.currentOutstanding,
+                currentOutstandingAsOf: dto.currentOutstandingAsOf,
                 startDate: dto.startDate,
                 tenureMonths: dto.tenureMonths,
                 emiDay: dto.emiDay,

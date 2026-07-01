@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import LocalAuthentication
 
 // MARK: - Biometric Lock Manager
@@ -7,6 +8,10 @@ import LocalAuthentication
 final class BiometricLockManager {
     private(set) var isUnlocked = false
     private(set) var biometricType: LABiometryType = .none
+    /// Guards against overlapping `authenticate()` calls — the scenePhase-driven
+    /// trigger and the lock screen's own appear-triggered/manual attempts can
+    /// otherwise both invoke LAContext at once and double-prompt Face ID.
+    private var isAuthenticating = false
 
     static let shared = BiometricLockManager()
 
@@ -47,6 +52,10 @@ final class BiometricLockManager {
     /// Authenticate the user. Returns true on success.
     @MainActor
     func authenticate() async -> Bool {
+        guard !isAuthenticating else { return false }
+        isAuthenticating = true
+        defer { isAuthenticating = false }
+
         let context = LAContext()
         context.localizedCancelTitle = "Enter Passcode"
 
@@ -128,9 +137,11 @@ struct BiometricLockScreen: View {
 
             Spacer()
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.systemBackground))
         .task {
             manager.checkBiometrics()
-            await manager.authenticate()
+            _ = await manager.authenticate()
         }
     }
 }
@@ -143,21 +154,39 @@ struct BiometricGate<Content: View>: View {
     @State private var manager = BiometricLockManager.shared
     @Environment(\.scenePhase) private var scenePhase
 
+    private var isLocked: Bool {
+        manager.isEnabled && !manager.isUnlocked
+    }
+
     var body: some View {
-        Group {
-            if !manager.isEnabled || manager.isUnlocked {
-                content()
-            } else {
-                BiometricLockScreen()
+        // `content()` stays mounted at all times — including while locked — so its
+        // navigation state (e.g. a pushed LoanDetailView) survives a lock/unlock
+        // cycle instead of being torn down and rebuilt from scratch. The lock
+        // screen is drawn as an overlay on top rather than swapped in via `if/else`,
+        // which also means it covers the app content immediately as backgrounding
+        // starts, before the app-switcher can snapshot the underlying screen.
+        content()
+            .overlay {
+                if isLocked {
+                    BiometricLockScreen()
+                }
             }
-        }
-        .onChange(of: scenePhase) { _, newPhase in
-            if newPhase == .background && manager.isEnabled {
-                manager.lock()
+            .onChange(of: scenePhase) { _, newPhase in
+                switch newPhase {
+                case .background:
+                    if manager.isEnabled {
+                        manager.lock()
+                    }
+                case .active:
+                    if isLocked {
+                        Task { await manager.authenticate() }
+                    }
+                default:
+                    break
+                }
             }
-        }
-        .onAppear {
-            manager.checkBiometrics()
-        }
+            .onAppear {
+                manager.checkBiometrics()
+            }
     }
 }

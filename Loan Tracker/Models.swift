@@ -14,6 +14,11 @@ final class Loan {
     var elapsedMonths: Double = 0      // Months of EMI already paid by the bank's schedule before in-app tracking began
     var paidBeforeTracking: Double = 0 // Actual total cash paid during elapsedMonths. 0 = assume standard EMI was paid each month.
     var currentOutstanding: Double = 0 // Direct override: if > 0, this becomes the starting balance, ignoring elapsedMonths/paidBeforeTracking.
+    /// The date `currentOutstanding` was actually true (e.g. the bank statement date), used as the
+    /// interest-accrual anchor for `remainingBalance`. nil falls back to `createdAt` for loans saved
+    /// before this field existed. Must be kept in sync whenever `currentOutstanding` is edited —
+    /// otherwise interest accrues over the wrong span the next time a payment is logged.
+    var currentOutstandingAsOf: Date? = nil
     var startDate: Date = Date()
     var tenureMonths: Int = 0          // Original agreed term in months
     var emiDay: Int = 1                // Day of month the EMI is auto-debited (1-31)
@@ -69,6 +74,7 @@ final class Loan {
          elapsedMonths: Double,
          paidBeforeTracking: Double,
          currentOutstanding: Double,
+         currentOutstandingAsOf: Date? = nil,
          startDate: Date,
          tenureMonths: Int,
          emiDay: Int,
@@ -86,6 +92,7 @@ final class Loan {
         self.elapsedMonths = elapsedMonths
         self.paidBeforeTracking = paidBeforeTracking
         self.currentOutstanding = currentOutstanding
+        self.currentOutstandingAsOf = currentOutstandingAsOf
         self.startDate = startDate
         self.tenureMonths = tenureMonths
         self.emiDay = emiDay
@@ -319,9 +326,13 @@ extension Loan {
         return cal.date(from: comps) ?? oneMonthAfter
     }
 
-    var derivedElapsedMonths: Int {
+    /// Translates any date onto the loan's EMI-cycle timeline: how many EMI
+    /// cycles (first EMI + emiDay cadence, no gaps assumed) have occurred by
+    /// that date. Used both for the live "as of today" baseline and to place
+    /// a specific logged payment's date on the same timeline, so it can be
+    /// reconciled against the baseline without double-counting.
+    private func emiCyclesElapsed(asOf referenceDate: Date) -> Int {
         let cal = Calendar.current
-        let today = Date()
 
         func emiDateIn(year: Int, month: Int) -> Date? {
             var dc = DateComponents(year: year, month: month, day: 1)
@@ -337,23 +348,54 @@ extension Loan {
         let firstComps = cal.dateComponents([.year, .month], from: firstEMI)
         guard let firstYear = firstComps.year, let firstMonth = firstComps.month else { return 0 }
 
-        if today < firstEMI { return 0 }
+        if referenceDate < firstEMI { return 0 }
 
-        // Count months from firstEMI's month to today's month.
-        let todayComps = cal.dateComponents([.year, .month, .day], from: today)
-        guard let todayYear = todayComps.year,
-              let todayMonth = todayComps.month,
-              let todayDay = todayComps.day else { return 0 }
+        // Count months from firstEMI's month to the reference date's month.
+        let refComps = cal.dateComponents([.year, .month, .day], from: referenceDate)
+        guard let refYear = refComps.year,
+              let refMonth = refComps.month,
+              let refDay = refComps.day else { return 0 }
 
-        let monthDiff = (todayYear * 12 + todayMonth) - (firstYear * 12 + firstMonth)
+        let monthDiff = (refYear * 12 + refMonth) - (firstYear * 12 + firstMonth)
 
-        // Has today's month's EMI day been reached?
-        guard let todayMonthEMI = emiDateIn(year: todayYear, month: todayMonth) else {
+        // Has the reference month's EMI day been reached?
+        guard let refMonthEMI = emiDateIn(year: refYear, month: refMonth) else {
             return max(0, monthDiff)
         }
-        let todayMonthEMIDay = cal.component(.day, from: todayMonthEMI)
+        let refMonthEMIDay = cal.component(.day, from: refMonthEMI)
 
-        return todayDay >= todayMonthEMIDay ? monthDiff + 1 : monthDiff
+        return refDay >= refMonthEMIDay ? monthDiff + 1 : monthDiff
+    }
+
+    /// Number of EMIs paid by today, auto-derived from startDate + emiDay.
+    /// Assumes standard EMI cadence with no gaps — used as the live baseline
+    /// for `remainingBalance` when no `currentOutstanding` override is set.
+    var derivedElapsedMonths: Int {
+        emiCyclesElapsed(asOf: Date())
+    }
+
+    /// Single reconciled count of completed EMI cycles — the one source of
+    /// truth behind both `nextEMIDate` and `totalMonthsPaid`.
+    ///
+    /// Baseline is `elapsedMonths` (override mode: the count implied by
+    /// `currentOutstanding`) — the number the loan form lets you edit
+    /// directly under "EMIs Paid". Each logged EMI-type payment is placed on
+    /// the EMI-cycle timeline by its own date, and only advances the total if
+    /// it implies a *later* cycle than the baseline already covers — so
+    /// logging a payment for a month the baseline already accounts for
+    /// doesn't add on top of it. (Summing `elapsedMonths + payments.count`
+    /// unconditionally was the cause of double-counted "months paid".)
+    var totalEMIsCompleted: Int {
+        let baseline = currentOutstanding > 0
+            ? Int(impliedMonthsPaid.rounded())
+            : Int(elapsedMonths)
+
+        let latestLoggedCycle = payments
+            .filter { $0.paymentType == .emi }
+            .map { emiCyclesElapsed(asOf: $0.date) }
+            .max() ?? 0
+
+        return max(baseline, latestLoggedCycle)
     }
 
     var totalPaid: Double {
@@ -361,7 +403,8 @@ extension Loan {
     }
 
     /// Current outstanding balance. Resolution order:
-    /// 1. If `currentOutstanding` is set, use that as the starting balance (as of `createdAt`).
+    /// 1. If `currentOutstanding` is set, use that as the starting balance
+    ///    (as of `currentOutstandingAsOf`, falling back to `createdAt`).
     /// 2. Otherwise compute from principal + elapsed amortization (using effective EMI
     ///    if `paidBeforeTracking` is set).
     /// 3. Then apply tracked payments, compounding interest between them.
@@ -369,15 +412,25 @@ extension Loan {
         let r = monthlyRate
         var balance: Double
         var cursor: Date
+        // Cycles already absorbed into the baseline below (non-override mode only).
+        // EMI-type payments dated within this many cycles are skipped further down
+        // so they aren't subtracted a second time on top of the baseline.
+        var elapsedBaseline = 0
 
         if currentOutstanding > 0 {
-            // Override mode: bank statement is the source of truth, as of loan creation.
+            // Override mode: bank statement is the source of truth, as of
+            // `currentOutstandingAsOf` (the statement date) — falling back to
+            // `createdAt` only for loans saved before that field existed.
             balance = currentOutstanding
-            cursor = createdAt
+            cursor = Calendar.current.startOfDay(for: currentOutstandingAsOf ?? createdAt)
         } else {
-            // Compute via amortization from start date, using auto-derived elapsed count.
-            let elapsed = max(0, min(Double(derivedElapsedMonths),
+            // Compute via amortization from start date, using the same reconciled
+            // EMI-cycle count as `nextEMIDate`/`totalMonthsPaid` (`totalEMIsCompleted`)
+            // rather than the raw live calendar count — so a logged EMI payment that's
+            // already reflected in that count isn't subtracted again below.
+            let elapsed = max(0, min(Double(totalEMIsCompleted),
                                      Double(tenureMonths == 0 ? Int.max : tenureMonths)))
+            elapsedBaseline = Int(elapsed.rounded())
             let M_elapsed: Double = (paidBeforeTracking > 0 && elapsed > 0)
                 ? paidBeforeTracking / elapsed
                 : monthlyPayment
@@ -390,7 +443,8 @@ extension Loan {
             balance = max(0, balance)
 
             let elapsedInt = Int(elapsed.rounded())
-            cursor = Calendar.current.date(byAdding: .month, value: elapsedInt, to: startDate) ?? startDate
+            let rawCursor = Calendar.current.date(byAdding: .month, value: elapsedInt, to: startDate) ?? startDate
+            cursor = Calendar.current.startOfDay(for: rawCursor)
         }
 
         // Build a merged timeline of payments and rate changes, then walk forward
@@ -402,11 +456,20 @@ extension Loan {
             static func < (lhs: TimelineEvent, rhs: TimelineEvent) -> Bool { lhs.date < rhs.date }
         }
 
-        var events: [TimelineEvent] = payments.map {
-            TimelineEvent(date: $0.date, payment: $0.amount, newMonthlyRate: nil)
+        // EMI-type payments already covered by `elapsedBaseline` are excluded here —
+        // otherwise they'd double-count against the baseline above. Prepayments are
+        // always additive on top of the standard EMI regardless of date, so they're
+        // never skipped.
+        // Normalized to midnight so month-gap math (`monthsBetween`) always sees clean
+        // calendar-day boundaries, regardless of leftover time-of-day on stored dates.
+        var events: [TimelineEvent] = payments.compactMap { payment in
+            if payment.paymentType == .emi, emiCyclesElapsed(asOf: payment.date) <= elapsedBaseline {
+                return nil
+            }
+            return TimelineEvent(date: Calendar.current.startOfDay(for: payment.date), payment: payment.amount, newMonthlyRate: nil)
         }
         for rc in rateChanges {
-            events.append(TimelineEvent(date: rc.effectiveDate, payment: 0, newMonthlyRate: rc.newAnnualRate / 12.0))
+            events.append(TimelineEvent(date: Calendar.current.startOfDay(for: rc.effectiveDate), payment: 0, newMonthlyRate: rc.newAnnualRate / 12.0))
         }
         events.sort()
 
@@ -693,17 +756,7 @@ extension Loan {
             return cal.date(from: dc)
         }
 
-        // Count tracked payments that are actual EMI payments (not lump-sum prepayments).
-        let trackedFullPayments = payments.filter { $0.paymentType == .emi }.count
-
-        // Base count of EMIs paid before tracking. Mirrors `totalMonthsPaid`:
-        // when the user provided `currentOutstanding`, we solve the amortization
-        // for the implied month count. Otherwise we use `elapsedMonths` (which
-        // the form auto-detects from startDate but the user can override).
-        let baseMonths: Int = currentOutstanding > 0
-            ? Int(impliedMonthsPaid.rounded())
-            : Int(elapsedMonths)
-        let totalEMIsPaid = baseMonths + trackedFullPayments
+        let totalEMIsPaid = totalEMIsCompleted
 
         // If the loan is fully paid up per its schedule, there's no next EMI.
         if tenureMonths > 0 && totalEMIsPaid >= tenureMonths { return nil }
@@ -749,11 +802,7 @@ extension Loan {
     /// Only count EMI-type payments toward "months paid".
     /// Lump-sum prepayments reduce principal but don't represent an EMI cycle.
     var totalMonthsPaid: Int {
-        let baseMonths: Double = currentOutstanding > 0
-            ? impliedMonthsPaid
-            : Double(derivedElapsedMonths)
-        let emiPayments = payments.filter { $0.paymentType == .emi }.count
-        return Int(baseMonths.rounded()) + emiPayments
+        totalEMIsCompleted
     }
 
     /// How many EMIs *should* have been paid by today, based on the loan's
@@ -806,10 +855,21 @@ extension Loan {
         return min(1.0, max(0.0, 1.0 - remainingBalance / principal))
     }
 
+    /// Whole calendar months between two dates, plus a fractional remainder for
+    /// any leftover days — proportioned against the actual length of the month
+    /// the remainder falls in (not a fixed average). This matches how EMI
+    /// interest is charged: a clean calendar month always yields exactly 1.0,
+    /// regardless of whether that specific month has 28, 30, or 31 days.
     private static func monthsBetween(_ from: Date, _ to: Date) -> Double {
-        let seconds = to.timeIntervalSince(from)
-        let secondsPerMonth = (365.25 / 12.0) * 24 * 60 * 60
-        return seconds / secondsPerMonth
+        let cal = Calendar.current
+        let comps = cal.dateComponents([.month, .day], from: from, to: to)
+        let wholeMonths = comps.month ?? 0
+        let remainderDays = comps.day ?? 0
+        guard let monthAnchor = cal.date(byAdding: .month, value: wholeMonths, to: from) else {
+            return Double(wholeMonths)
+        }
+        let daysInThatMonth = cal.range(of: .day, in: .month, for: monthAnchor)?.count ?? 30
+        return Double(wholeMonths) + Double(remainderDays) / Double(daysInThatMonth)
     }
 }
 

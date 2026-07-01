@@ -514,7 +514,7 @@ struct LoanRow: View {
                     // Show the full grouped format when it fits; fall back to
                     // compact (₹4.0L, ₹21.3L, ₹1.5Cr) when the row is tight.
                     ViewThatFits(in: .horizontal) {
-                        Text(loan.remainingBalance, format: .currency(code: loan.currencyCode))
+                        Text(loan.remainingBalance, format: .currency(code: loan.currencyCode).precision(.fractionLength(0)))
                             .font(.subheadline.bold())
                             .monospacedDigit()
                             .lineLimit(1)
@@ -625,6 +625,8 @@ struct LoanDetailView: View {
     @State private var showingDocuments = false
     @State private var showingCelebration = false
     @State private var showingDocumentImport = false
+    @State private var paymentToEdit: Payment?
+    @State private var paymentPendingDelete: Payment?
     /// When true, the view auto-scrolls to the Playground section on appear.
     /// Used when navigating in from a "try prepayment" nudge.
     var autoScrollToPlayground: Bool = false
@@ -649,7 +651,7 @@ struct LoanDetailView: View {
                             Text("Remaining")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            Text(loan.remainingBalance, format: .currency(code: loan.currencyCode))
+                            Text(loan.remainingBalance, format: .currency(code: loan.currencyCode).precision(.fractionLength(0)))
                                 .font(.system(size: 30, weight: .bold, design: .rounded))
                                 .minimumScaleFactor(0.6)
                                 .lineLimit(1)
@@ -893,8 +895,41 @@ struct LoanDetailView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button {
+                                paymentPendingDelete = p
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                            .tint(.red)
+                        }
+                        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                            Button {
+                                paymentToEdit = p
+                            } label: {
+                                Label("Edit", systemImage: "pencil")
+                            }
+                            .tint(.blue)
+                        }
+                        .confirmationDialog(
+                            "Delete this payment?",
+                            isPresented: Binding(
+                                get: { paymentPendingDelete?.persistentModelID == p.persistentModelID },
+                                set: { if !$0 { paymentPendingDelete = nil } }
+                            ),
+                            titleVisibility: .visible
+                        ) {
+                            Button("Delete", role: .destructive) {
+                                deletePayment(p)
+                                paymentPendingDelete = nil
+                            }
+                            Button("Cancel", role: .cancel) {
+                                paymentPendingDelete = nil
+                            }
+                        } message: {
+                            Text("\(p.amount, format: .currency(code: loan.currencyCode)) on \(p.date, format: .dateTime.day().month(.abbreviated).year())")
+                        }
                     }
-                    .onDelete(perform: deletePayments)
                 }
             }
         }
@@ -981,6 +1016,9 @@ struct LoanDetailView: View {
         .sheet(isPresented: $showingDocumentImport) {
             DocumentImportView(targetLoan: loan)
         }
+        .sheet(item: $paymentToEdit) { payment in
+            EditPaymentView(payment: payment)
+        }
         .fullScreenCover(isPresented: $showingCelebration) {
             LoanCelebrationView(
                 loanName: loan.name,
@@ -1001,13 +1039,9 @@ struct LoanDetailView: View {
         }
     }
 
-    private func deletePayments(at offsets: IndexSet) {
-        let sorted = loan.payments.sorted { $0.date > $1.date }
-        for index in offsets {
-            let payment = sorted[index]
-            loan.payments.removeAll { $0.persistentModelID == payment.persistentModelID }
-            context.delete(payment)
-        }
+    private func deletePayment(_ payment: Payment) {
+        loan.payments.removeAll { $0.persistentModelID == payment.persistentModelID }
+        context.delete(payment)
         try? context.save()
         refreshAppState()
     }
@@ -1498,6 +1532,7 @@ struct LoanFormView: View {
     @State private var tenureUnit: TenureUnit
     @State private var paidBeforeTracking: Double
     @State private var currentOutstanding: Double
+    @State private var currentOutstandingAsOf: Date
     @State private var elapsedMonths: Double
     @State private var selectedIcon: LoanIcon
     @State private var firstEMIDate: Date
@@ -1523,6 +1558,7 @@ struct LoanFormView: View {
             _tenureUnit = State(initialValue: tu)
             _paidBeforeTracking = State(initialValue: loan.paidBeforeTracking)
             _currentOutstanding = State(initialValue: loan.currentOutstanding)
+            _currentOutstandingAsOf = State(initialValue: loan.currentOutstandingAsOf ?? loan.createdAt)
             _elapsedMonths = State(initialValue: loan.elapsedMonths)
             _selectedIcon = State(initialValue: LoanIcon.resolve(loan.iconKey))
             _firstEMIDate = State(initialValue: loan.firstEMIDate ?? loan.effectiveFirstEMIDate)
@@ -1541,6 +1577,7 @@ struct LoanFormView: View {
             _tenureUnit = State(initialValue: .years)
             _paidBeforeTracking = State(initialValue: 0)
             _currentOutstanding = State(initialValue: 0)
+            _currentOutstandingAsOf = State(initialValue: .now)
             _elapsedMonths = State(initialValue: 0)
             _selectedIcon = State(initialValue: .generic)
             _firstEMIDate = State(initialValue: Calendar.current.date(byAdding: .month, value: 1, to: .now) ?? .now)
@@ -1572,6 +1609,7 @@ struct LoanFormView: View {
         }
         _paidBeforeTracking = State(initialValue: loan.paidBeforeTracking)
         _currentOutstanding = State(initialValue: prefill.currentOutstanding ?? loan.currentOutstanding)
+        _currentOutstandingAsOf = State(initialValue: prefill.currentOutstanding != nil ? .now : (loan.currentOutstandingAsOf ?? loan.createdAt))
         _elapsedMonths = State(initialValue: loan.elapsedMonths)
         _selectedIcon = State(initialValue: LoanIcon.resolve(loan.iconKey))
         if let day = prefill.emiDay, (1...31).contains(day) {
@@ -1612,6 +1650,7 @@ struct LoanFormView: View {
         }
         _paidBeforeTracking = State(initialValue: 0)
         _currentOutstanding = State(initialValue: prefill.currentOutstanding ?? 0)
+        _currentOutstandingAsOf = State(initialValue: .now)
         _elapsedMonths = State(initialValue: 0)
         _selectedIcon = State(initialValue: .generic)
         if let day = prefill.emiDay, (1...31).contains(day),
@@ -1756,10 +1795,13 @@ struct LoanFormView: View {
 
                 Section {
                     numberRow("Current Outstanding", value: $currentOutstanding)
+                    if currentOutstanding > 0 {
+                        DatePicker("As Of", selection: $currentOutstandingAsOf, displayedComponents: .date)
+                    }
                 } header: {
                     Text("Or, Skip the Math")
                 } footer: {
-                    Text("If you already know your current outstanding from your bank app or statement, enter it here. This overrides the calculation above and becomes the source of truth.")
+                    Text("If you already know your current outstanding from your bank app or statement, enter it here. This overrides the calculation above and becomes the source of truth. \"As Of\" should be the date that balance was true (e.g. your statement date) — interest is accrued from there whenever you log a new payment.")
                 }
             }
             .navigationTitle(isEditing ? "Edit Loan" : "New Loan")
@@ -1829,6 +1871,9 @@ struct LoanFormView: View {
         // EMI day is derived from the first-EMI date — the model still keeps
         // emiDay as a separate field, but the user only picks the date.
         let derivedEMIDay = Calendar.current.component(.day, from: firstEMIDate)
+        // Strip time-of-day so month-gap math (remainingBalance) always sees clean
+        // calendar-day boundaries, regardless of what time the picker happened to open at.
+        let normalizedOutstandingAsOf = Calendar.current.startOfDay(for: currentOutstandingAsOf)
 
         if let existing = existingLoan {
             existing.name = name
@@ -1838,6 +1883,7 @@ struct LoanFormView: View {
             existing.elapsedMonths = elapsedMonths
             existing.paidBeforeTracking = paidBeforeTracking
             existing.currentOutstanding = currentOutstanding
+            existing.currentOutstandingAsOf = currentOutstanding > 0 ? normalizedOutstandingAsOf : nil
             existing.startDate = startDate
             existing.tenureMonths = tenureInMonths
             existing.emiDay = derivedEMIDay
@@ -1856,6 +1902,7 @@ struct LoanFormView: View {
                 elapsedMonths: elapsedMonths,
                 paidBeforeTracking: paidBeforeTracking,
                 currentOutstanding: currentOutstanding,
+                currentOutstandingAsOf: currentOutstanding > 0 ? normalizedOutstandingAsOf : nil,
                 startDate: startDate,
                 tenureMonths: tenureInMonths,
                 emiDay: derivedEMIDay,
@@ -1970,7 +2017,10 @@ struct AddPaymentView: View {
 
     private func save() {
         guard let loan = selectedLoan else { return }
-        let payment = Payment(amount: amount, date: date, note: note.isEmpty ? nil : note, type: paymentType)
+        // Strip time-of-day so month-gap math (remainingBalance) always sees clean
+        // calendar-day boundaries, regardless of what time the picker happened to open at.
+        let normalizedDate = Calendar.current.startOfDay(for: date)
+        let payment = Payment(amount: amount, date: normalizedDate, note: note.isEmpty ? nil : note, type: paymentType)
         loan.payments.append(payment)
         context.insert(payment)
         try? context.save()
@@ -1983,6 +2033,71 @@ struct AddPaymentView: View {
         } else {
             dismiss()
         }
+    }
+}
+
+// MARK: - Edit Payment
+
+struct EditPaymentView: View {
+    @Environment(\.modelContext) private var context
+    @Environment(\.dismiss) private var dismiss
+
+    @Bindable var payment: Payment
+
+    @State private var amount: Double = 0
+    @State private var date: Date = .now
+    @State private var note: String = ""
+    @State private var paymentType: PaymentType = .emi
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Payment") {
+                    Picker("Type", selection: $paymentType) {
+                        ForEach(PaymentType.allCases) { type in
+                            Text(type.label).tag(type)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    HStack {
+                        Text("Amount")
+                        Spacer()
+                        FormattedAmountField(value: $amount)
+                    }
+                    DatePicker("Date", selection: $date, displayedComponents: .date)
+                    TextField("Note (optional)", text: $note)
+                }
+            }
+            .navigationTitle("Edit Payment")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save", action: save).disabled(amount <= 0)
+                }
+            }
+            .onAppear {
+                amount = payment.amount
+                date = payment.date
+                note = payment.note ?? ""
+                paymentType = payment.paymentType
+            }
+        }
+    }
+
+    private func save() {
+        payment.amount = amount
+        // Strip time-of-day so month-gap math (remainingBalance) always sees clean
+        // calendar-day boundaries, regardless of what time the picker happened to open at.
+        payment.date = Calendar.current.startOfDay(for: date)
+        payment.note = note.isEmpty ? nil : note
+        payment.type = paymentType.rawValue
+        try? context.save()
+        refreshAppState()
+        dismiss()
     }
 }
 
