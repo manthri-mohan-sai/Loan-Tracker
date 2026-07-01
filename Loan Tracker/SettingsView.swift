@@ -20,7 +20,6 @@ struct SettingsView: View {
     @State private var showingImportSheet = false
     @State private var showingCSVExport = false
     @State private var showingPermissionAlert = false
-    @State private var showModelDownload = false
     @State private var biometricManager = BiometricLockManager.shared
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = true
     @AppStorage("defaultCurrency") private var defaultCurrency: String = Locale.current.currency?.identifier ?? "USD"
@@ -31,7 +30,6 @@ struct SettingsView: View {
                 notificationsSection
                 currencySection
                 securitySection
-                aiModelSection
                 dataSection
                 aboutSection
             }
@@ -50,9 +48,6 @@ struct SettingsView: View {
             }
             .sheet(isPresented: $showingCSVExport) {
                 CSVExportSheet(loans: loans)
-            }
-            .sheet(isPresented: $showModelDownload) {
-                ModelDownloadView()
             }
             .alert("Notifications Disabled", isPresented: $showingPermissionAlert) {
                 Button("Open Settings") {
@@ -200,61 +195,6 @@ struct SettingsView: View {
                 Text("No biometric authentication is available on this device.")
             } else {
                 Text("Require \(biometricManager.biometricName) to open the app.")
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var aiModelSection: some View {
-        Section {
-            HStack {
-                Label("On-Device AI", systemImage: "cpu")
-                Spacer()
-                switch CoreMLModelManager.shared.state {
-                case .notDownloaded:
-                    Text("Not Downloaded")
-                        .foregroundStyle(.secondary)
-                        .font(.caption)
-                case .downloading(let progress):
-                    Text("\(Int(progress * 100))%")
-                        .foregroundStyle(.secondary)
-                        .font(.caption.monospacedDigit())
-                case .downloaded:
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                case .failed:
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                }
-            }
-
-            Button {
-                showModelDownload = true
-            } label: {
-                switch CoreMLModelManager.shared.state {
-                case .notDownloaded:
-                    Label("Download AI Model (~350 MB)", systemImage: "arrow.down.circle")
-                case .downloading:
-                    Label("View Download Progress", systemImage: "arrow.down.circle")
-                case .downloaded:
-                    Label("Manage AI Model", systemImage: "cpu.fill")
-                case .failed:
-                    Label("Retry Download", systemImage: "arrow.clockwise")
-                }
-            }
-        } header: {
-            Text("AI Model")
-        } footer: {
-            switch CoreMLModelManager.shared.state {
-            case .notDownloaded:
-                Text("Download the on-device AI model to process loan documents privately. Requires WiFi.")
-            case .downloading(let progress):
-                Text("Downloading… \(CoreMLModelManager.shared.downloadedSizeString(progress: progress))")
-            case .downloaded:
-                Text("On-device AI is active. Documents are processed privately on your device.")
-            case .failed(let message):
-                Text("Download failed: \(message)")
-                    .foregroundStyle(.red)
             }
         }
     }

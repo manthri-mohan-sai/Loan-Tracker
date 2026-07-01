@@ -1,5 +1,4 @@
 import Foundation
-import FoundationModels
 
 // MARK: - Document Types
 
@@ -63,90 +62,38 @@ enum LoanDocumentType: String, CaseIterable, Identifiable {
     }
 }
 
-// MARK: - @Generable Structs for FoundationModels
-
-/// Stage 1: Document classification.
-@Generable(description: "Classification of a scanned loan document")
-struct DocumentClassificationOutput {
-    @Guide(description: "The type of loan document. Must be one of: sanctionLetter, loanAgreement, disbursementLetter, loanStatement, amortizationSchedule, rateChangeLetter, interestCertificate, closureLetter, insurancePolicy, collateralDocument, restructuringAgreement, unknown")
-    var documentType: String
-
-    @Guide(description: "Brief reason for the classification in one short sentence")
-    var reasoning: String
-}
+// MARK: - Extracted Field Structs
 
 /// Stage 2a: Fields for creating a new loan (sanction letter, agreement, disbursement).
-@Generable(description: "Fields extracted from a loan sanction letter or agreement")
 struct LoanCreationFields {
-    @Guide(description: "Name or description of the loan, e.g. 'Home Loan'")
     var loanName: String
-
-    @Guide(description: "Sanctioned or principal loan amount as a number")
     var principalAmount: Double
-
-    @Guide(description: "Annual interest rate as a percentage number, e.g. 8.5 for 8.5%")
     var annualInterestRatePercent: Double
-
-    @Guide(description: "Monthly EMI or installment amount")
     var monthlyEMI: Double
-
-    @Guide(description: "Loan tenure in months")
     var tenureMonths: Int
-
-    @Guide(description: "Loan start or disbursement date as YYYY-MM-DD")
     var startDate: String
-
-    @Guide(description: "Day of month when EMI is debited, 1 to 31")
     var emiDay: Int
-
-    @Guide(description: "Name of the lending bank or institution")
     var bankName: String
-
-    @Guide(description: "Whether the rate is floating or fixed. Use 'floating' or 'fixed'")
     var rateType: String
-
-    @Guide(description: "Prepayment penalty as a percentage, 0 if none")
     var prepaymentPenaltyPercent: Double
-
-    @Guide(description: "ISO 4217 currency code like INR, USD, EUR, GBP")
     var currencyCode: String
 }
 
 /// Stage 2b: Fields for a rate change letter.
-@Generable(description: "Fields extracted from a rate change notification letter")
 struct RateChangeFields {
-    @Guide(description: "New annual interest rate as a percentage number")
     var newRatePercent: Double
-
-    @Guide(description: "Effective date of the rate change as YYYY-MM-DD")
     var effectiveDate: String
-
-    @Guide(description: "Previous annual interest rate as a percentage, 0 if not mentioned")
     var previousRatePercent: Double
-
-    @Guide(description: "Reason for rate change if mentioned, empty string otherwise")
     var reason: String
-
-    @Guide(description: "Name of the bank")
     var bankName: String
 }
 
 /// Stage 2c: Fields for a loan statement.
-@Generable(description: "Fields extracted from a loan statement")
 struct LoanStatementFields {
-    @Guide(description: "Outstanding or remaining balance as of the statement date")
     var outstandingBalance: Double
-
-    @Guide(description: "Statement date as YYYY-MM-DD")
     var statementDate: String
-
-    @Guide(description: "Number of EMIs paid so far, 0 if not mentioned")
     var emisPaid: Int
-
-    @Guide(description: "Total interest paid so far, 0 if not mentioned")
     var totalInterestPaid: Double
-
-    @Guide(description: "Name of the bank")
     var bankName: String
 }
 
@@ -174,8 +121,7 @@ struct DocumentExtractionResult {
 
 // MARK: - Extraction Protocol
 
-/// Abstraction layer for document intelligence. Both FoundationModels and
-/// a downloaded CoreML model can conform to this protocol.
+/// Abstraction layer for document intelligence extraction backends.
 protocol DocumentExtractor: Sendable {
     func classify(ocrText: String) async throws -> DocumentClassificationResult
     func extractLoanCreation(ocrText: String) async throws -> LoanCreationFields
@@ -213,175 +159,9 @@ extension DocumentExtractor {
     }
 }
 
-// MARK: - FoundationModels Implementation
-
-/// Uses Apple Intelligence on-device LLM for document classification and extraction.
-struct FoundationModelsExtractor: DocumentExtractor {
-
-    func classify(ocrText: String) async throws -> DocumentClassificationResult {
-        let session = LanguageModelSession(instructions: """
-            You are a financial document classifier for a loan tracking app.
-
-            TASK: Read the OCR text below and output EXACTLY ONE of these document type values:
-            - sanctionLetter (bank approves/sanctions a loan — contains sanctioned amount, terms)
-            - loanAgreement (formal contract between borrower and lender — terms & conditions, schedules)
-            - disbursementLetter (confirms money has been disbursed/credited to borrower)
-            - loanStatement (periodic account statement showing outstanding balance, payments made)
-            - amortizationSchedule (month-by-month EMI breakup table with principal/interest split)
-            - rateChangeLetter (notification that interest rate has been revised)
-            - interestCertificate (yearly certificate showing interest paid, used for tax filing)
-            - closureLetter (loan fully repaid — NOC / No Dues / Closure confirmation)
-            - insurancePolicy (loan protection or property insurance policy document)
-            - collateralDocument (property papers, title deed, valuation report, mortgage deed)
-            - restructuringAgreement (loan terms modified — moratorium, rescheduled payments)
-            - unknown (if none of the above match)
-
-            RULES:
-            - The documentType value must be spelled EXACTLY as listed above (camelCase, no spaces).
-            - If the document contains a loan amount, interest rate, and tenure but no specific type indicator, classify as sanctionLetter.
-            - Focus on header text, subject lines, and key financial terms to decide.
-            """)
-
-        let truncated = String(ocrText.prefix(3000))
-        let response = try await session.respond(
-            to: "Classify this loan document. Output the documentType and a one-sentence reasoning.\n\nDOCUMENT TEXT:\n\(truncated)",
-            generating: DocumentClassificationOutput.self
-        )
-
-        let docType = LoanDocumentType(rawValue: response.content.documentType) ?? .unknown
-        return DocumentClassificationResult(
-            documentType: docType,
-            reasoning: response.content.reasoning
-        )
-    }
-
-    func extractLoanCreation(ocrText: String) async throws -> LoanCreationFields {
-        let session = LanguageModelSession(instructions: """
-            You extract structured loan data from scanned bank documents (sanction letters, agreements, disbursement letters).
-
-            FIELD-BY-FIELD EXTRACTION RULES:
-
-            1. loanName: Look for "Home Loan", "Personal Loan", "Car Loan", "Housing Loan", "Vehicle Loan", \
-            "Education Loan", "Gold Loan", "Loan Against Property", "Business Loan". \
-            If not found, use "Loan".
-
-            2. principalAmount: The sanctioned/approved/disbursed loan amount. \
-            Look for: "Sanctioned Amount", "Loan Amount", "Facility Amount", "Principal", "Amount Sanctioned", "Disbursed Amount". \
-            Return the raw number WITHOUT currency symbols or commas. Example: 5000000 not "₹50,00,000".
-
-            3. annualInterestRatePercent: The yearly interest rate as a percentage NUMBER. \
-            Look for: "Rate of Interest", "ROI", "Interest Rate", "Rate p.a.", "APR", "Annual Rate". \
-            Return just the number. Example: 8.5 not "8.5%" or "8.50% p.a.".
-
-            4. monthlyEMI: The monthly installment amount. \
-            Look for: "EMI", "Monthly Installment", "Equated Monthly Installment", "Repayment Amount". \
-            Return raw number without currency symbols.
-
-            5. tenureMonths: Total loan duration in MONTHS (not years). \
-            If document says "20 years", return 240. If it says "180 months", return 180. \
-            Look for: "Tenure", "Period", "Repayment Period", "Loan Term", "Duration".
-
-            6. startDate: Loan start/disbursement/sanction date in YYYY-MM-DD format. \
-            Convert from any format (DD/MM/YYYY, DD-MMM-YYYY, etc.) to YYYY-MM-DD. \
-            If not found, return empty string "".
-
-            7. emiDay: Day of month when EMI is debited (1-31). \
-            Look for: "EMI due date", "Debit date", "Installment date". If not found, return 0.
-
-            8. bankName: Name of the lending institution. \
-            Look in letterhead, header, or "Dear Customer" section. Return full name like "HDFC Bank", "State Bank of India".
-
-            9. rateType: Return "floating" if rate is linked to MCLR/repo/RLLR/benchmark/variable. \
-            Return "fixed" if explicitly stated as fixed. Return "" if unclear.
-
-            10. prepaymentPenaltyPercent: Prepayment/foreclosure penalty percentage. Return 0 if not mentioned.
-
-            11. currencyCode: ISO 4217 code. "INR" if ₹/Rs/Rupees, "USD" if $/Dollars, "EUR" if €, "GBP" if £. \
-            Return "" if not determinable.
-
-            IMPORTANT: For any field not found in the document, use the default (0 for numbers, "" for strings). \
-            Never guess or hallucinate values that aren't in the text.
-            """)
-
-        let truncated = String(ocrText.prefix(4000))
-        let response = try await session.respond(
-            to: "Extract all loan fields from this document:\n\nDOCUMENT TEXT:\n\(truncated)",
-            generating: LoanCreationFields.self
-        )
-        return response.content
-    }
-
-    func extractRateChange(ocrText: String) async throws -> RateChangeFields {
-        let session = LanguageModelSession(instructions: """
-            You extract interest rate change details from bank notification letters.
-
-            FIELD-BY-FIELD EXTRACTION RULES:
-
-            1. newRatePercent: The NEW/revised annual interest rate as a percentage number. \
-            Look for: "Revised Rate", "New Rate of Interest", "New ROI", "Rate w.e.f.", "Current Rate". \
-            Return just the number (e.g., 8.75).
-
-            2. effectiveDate: The date the new rate takes effect, in YYYY-MM-DD format. \
-            Look for: "w.e.f.", "with effect from", "effective from", "effective date", "applicable from". \
-            Convert any date format to YYYY-MM-DD.
-
-            3. previousRatePercent: The OLD/existing rate before revision, as a percentage number. \
-            Look for: "Old Rate", "Previous Rate", "Existing Rate", "Earlier Rate". Return 0 if not mentioned.
-
-            4. reason: Brief reason for the change. \
-            Look for: "Repo Rate", "MCLR", "RBI", "benchmark", "policy rate". Return "" if not stated.
-
-            5. bankName: Name of the bank from the letterhead or body.
-
-            IMPORTANT: Return 0 for numbers and "" for strings if not found. Never guess values.
-            """)
-
-        let truncated = String(ocrText.prefix(3000))
-        let response = try await session.respond(
-            to: "Extract rate change details from this bank letter:\n\nDOCUMENT TEXT:\n\(truncated)",
-            generating: RateChangeFields.self
-        )
-        return response.content
-    }
-
-    func extractStatement(ocrText: String) async throws -> LoanStatementFields {
-        let session = LanguageModelSession(instructions: """
-            You extract summary data from loan account statements.
-
-            FIELD-BY-FIELD EXTRACTION RULES:
-
-            1. outstandingBalance: The current remaining/outstanding loan balance. \
-            Look for: "Outstanding Balance", "Principal Outstanding", "Balance as on", "Closing Balance", \
-            "Amount Due", "Remaining Principal". Return raw number without currency symbols.
-
-            2. statementDate: The date the statement was generated or the "as on" date, in YYYY-MM-DD format. \
-            Convert any format to YYYY-MM-DD.
-
-            3. emisPaid: Number of EMIs/installments paid so far. \
-            Look for: "EMIs Paid", "Installments Paid", "No. of EMIs". Return 0 if not mentioned.
-
-            4. totalInterestPaid: Total interest paid to date. \
-            Look for: "Total Interest", "Interest Paid", "Cumulative Interest", "Interest Component". \
-            Return raw number. Return 0 if not mentioned.
-
-            5. bankName: Name of the bank from the letterhead or header.
-
-            IMPORTANT: Return 0 for numbers and "" for strings if not found. Never guess values.
-            """)
-
-        let truncated = String(ocrText.prefix(3000))
-        let response = try await session.respond(
-            to: "Extract statement summary from this loan statement:\n\nDOCUMENT TEXT:\n\(truncated)",
-            generating: LoanStatementFields.self
-        )
-        return response.content
-    }
-}
-
-// MARK: - Regex-Based Fallback Extractor
+// MARK: - Regex-Based Extractor
 
 /// Extracts loan details from OCR text using regex patterns.
-/// Works on all devices without requiring Apple Intelligence or CoreML.
 struct RegexExtractor: DocumentExtractor {
 
     func classify(ocrText: String) async throws -> DocumentClassificationResult {
@@ -787,240 +567,11 @@ struct RegexExtractor: DocumentExtractor {
     }
 }
 
-// MARK: - CoreML Fallback Implementation
-
-/// Uses a locally downloaded Qwen model (CoreML) for document extraction
-/// on devices without Apple Intelligence.
-/// Requires iOS 18+ for stateful KV-cache inference.
-struct CoreMLExtractor: DocumentExtractor {
-    let modelURL: URL
-
-    // MARK: - Classify
-
-    func classify(ocrText: String) async throws -> DocumentClassificationResult {
-        try await ensureLoaded()
-
-        let system = """
-            You are a loan document classifier.
-            Reply with ONLY a JSON object: {"documentType": "<value>"}
-            where <value> is exactly one of:
-            sanctionLetter, loanAgreement, disbursementLetter, loanStatement,
-            amortizationSchedule, rateChangeLetter, interestCertificate,
-            closureLetter, insurancePolicy, collateralDocument, restructuringAgreement, unknown
-            No extra text. No markdown fences.
-            """
-        let user = String(ocrText.prefix(1500))
-        let raw = try await LocalLLMService.shared.generate(
-            system: system, user: user, maxNewTokens: 64
-        )
-        let json = extractFirstJSON(from: raw)
-        guard
-            let data    = json.data(using: .utf8),
-            let obj     = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let typeStr = obj["documentType"] as? String
-        else {
-            return DocumentClassificationResult(documentType: .unknown,
-                                               reasoning: "CoreML parse failed: \(raw.prefix(80))")
-        }
-        let docType = LoanDocumentType(rawValue: typeStr) ?? .unknown
-        return DocumentClassificationResult(documentType: docType,
-                                            reasoning: "Qwen on-device")
-    }
-
-    // MARK: - Extract Loan Creation
-
-    func extractLoanCreation(ocrText: String) async throws -> LoanCreationFields {
-        try await ensureLoaded()
-
-        let system = """
-            Extract loan fields from this document.
-            Return ONLY valid JSON — no markdown, no extra text — with these exact keys:
-            loanName (string), principalAmount (number), annualInterestRatePercent (number),
-            monthlyEMI (number), tenureMonths (integer), startDate (YYYY-MM-DD string),
-            emiDay (integer 1-31), bankName (string), rateType (\"fixed\" or \"floating\"),
-            prepaymentPenaltyPercent (number), currencyCode (ISO 4217 string).
-            Use 0 for unknown numbers, empty string for unknown text fields.
-            """
-        let user = String(ocrText.prefix(3000))
-        let raw = try await LocalLLMService.shared.generate(
-            system: system, user: user, maxNewTokens: 350
-        )
-        return try parseLoanCreationFields(from: raw)
-    }
-
-    // MARK: - Extract Rate Change
-
-    func extractRateChange(ocrText: String) async throws -> RateChangeFields {
-        try await ensureLoaded()
-
-        let system = """
-            Extract rate change fields from this bank letter.
-            Return ONLY valid JSON with these exact keys:
-            newRatePercent (number), effectiveDate (YYYY-MM-DD string),
-            previousRatePercent (number), reason (string), bankName (string).
-            Use 0 for unknown numbers, empty string for unknown text.
-            """
-        let user = String(ocrText.prefix(2000))
-        let raw = try await LocalLLMService.shared.generate(
-            system: system, user: user, maxNewTokens: 150
-        )
-        return try parseRateChangeFields(from: raw)
-    }
-
-    // MARK: - Extract Statement
-
-    func extractStatement(ocrText: String) async throws -> LoanStatementFields {
-        try await ensureLoaded()
-
-        let system = """
-            Extract loan statement fields from this document.
-            Return ONLY valid JSON with these exact keys:
-            outstandingBalance (number), statementDate (YYYY-MM-DD string),
-            emisPaid (integer), totalInterestPaid (number), bankName (string).
-            Use 0 for unknown numbers, empty string for unknown text.
-            """
-        let user = String(ocrText.prefix(2000))
-        let raw = try await LocalLLMService.shared.generate(
-            system: system, user: user, maxNewTokens: 150
-        )
-        return try parseStatementFields(from: raw)
-    }
-
-    // MARK: - Private Helpers
-
-    private func ensureLoaded() async throws {
-        if await !LocalLLMService.shared.isLoaded {
-            try await LocalLLMService.shared.load(from: modelURL)
-        }
-    }
-
-    /// Extracts the first JSON object found in raw model output.
-    /// Handles models that wrap output in ```json ... ``` fences.
-    private func extractFirstJSON(from text: String) -> String {
-        let stripped = text
-            .replacingOccurrences(of: "```json", with: "")
-            .replacingOccurrences(of: "```",     with: "")
-        if let start = stripped.range(of: "{"),
-           let end   = stripped.range(of: "}", options: .backwards) {
-            return String(stripped[start.lowerBound...end.upperBound])
-        }
-        return stripped
-    }
-
-    private func parseLoanCreationFields(from raw: String) throws -> LoanCreationFields {
-        let json = extractFirstJSON(from: raw)
-        guard
-            let data = json.data(using: .utf8),
-            let obj  = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { throw LLMError.jsonParseFailed(raw) }
-
-        return LoanCreationFields(
-            loanName:                  obj["loanName"]                  as? String ?? "Loan",
-            principalAmount:           obj["principalAmount"]           as? Double ?? 0,
-            annualInterestRatePercent: obj["annualInterestRatePercent"] as? Double ?? 0,
-            monthlyEMI:                obj["monthlyEMI"]                as? Double ?? 0,
-            tenureMonths:              obj["tenureMonths"]              as? Int    ?? 0,
-            startDate:                 obj["startDate"]                 as? String ?? "",
-            emiDay:                    obj["emiDay"]                    as? Int    ?? 0,
-            bankName:                  obj["bankName"]                  as? String ?? "",
-            rateType:                  obj["rateType"]                  as? String ?? "",
-            prepaymentPenaltyPercent:  obj["prepaymentPenaltyPercent"]  as? Double ?? 0,
-            currencyCode:              obj["currencyCode"]              as? String ?? ""
-        )
-    }
-
-    private func parseRateChangeFields(from raw: String) throws -> RateChangeFields {
-        let json = extractFirstJSON(from: raw)
-        guard
-            let data = json.data(using: .utf8),
-            let obj  = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { throw LLMError.jsonParseFailed(raw) }
-
-        return RateChangeFields(
-            newRatePercent:      obj["newRatePercent"]      as? Double ?? 0,
-            effectiveDate:       obj["effectiveDate"]       as? String ?? "",
-            previousRatePercent: obj["previousRatePercent"] as? Double ?? 0,
-            reason:              obj["reason"]              as? String ?? "",
-            bankName:            obj["bankName"]            as? String ?? ""
-        )
-    }
-
-    private func parseStatementFields(from raw: String) throws -> LoanStatementFields {
-        let json = extractFirstJSON(from: raw)
-        guard
-            let data = json.data(using: .utf8),
-            let obj  = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { throw LLMError.jsonParseFailed(raw) }
-
-        return LoanStatementFields(
-            outstandingBalance: obj["outstandingBalance"] as? Double ?? 0,
-            statementDate:      obj["statementDate"]      as? String ?? "",
-            emisPaid:           obj["emisPaid"]           as? Int    ?? 0,
-            totalInterestPaid:  obj["totalInterestPaid"]  as? Double ?? 0,
-            bankName:           obj["bankName"]           as? String ?? ""
-        )
-    }
-}
-
 
 // MARK: - Extractor Factory
 
-/// Picks the best available extraction backend.
-enum ExtractorAvailability {
-    case appleIntelligence
-    case downloadedModel
-    case regexFallback
-}
-
 enum DocumentExtractorFactory {
-  
-    /// Check which extraction backend is available (best → worst).
-    static func availability() -> ExtractorAvailability {
-        // TEMP: Force local GGUF model for on-device testing
-        // Uncomment original logic below when ready for production
-        return .downloadedModel
-
-        // Original logic:
-        // let model = SystemLanguageModel.default
-        // if case .available = model.availability {
-        //     return .appleIntelligence
-        // }
-        // if CoreMLModelManager.shared.state == .downloaded {
-        //     return .downloadedModel
-        // }
-        // return .regexFallback
-    }
-
-    /// Create the best available extractor. Always returns a valid extractor:
-    /// Apple Intelligence > Local GGUF > Regex fallback.
-    static func makeExtractor() -> (extractor: DocumentExtractor, source: ExtractorAvailability) {
-       
-        switch availability() {
-        case .appleIntelligence:
-            return (FoundationModelsExtractor(), .appleIntelligence)
-        case .downloadedModel:
-            return (CoreMLExtractor(modelURL: CoreMLModelManager.shared.modelURL), .downloadedModel)
-        case .regexFallback:
-            return (RegexExtractor(), .regexFallback)
-        }
-    }
-}
-
-// MARK: - Errors
-
-enum ExtractionError: LocalizedError {
-    case modelNotAvailable
-    case classificationFailed
-    case extractionFailed(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .modelNotAvailable:
-            return "No document processing model is available. Enable Apple Intelligence or download the on-device model."
-        case .classificationFailed:
-            return "Could not determine the document type."
-        case .extractionFailed(let detail):
-            return "Failed to extract details: \(detail)"
-        }
+    static func makeExtractor() -> DocumentExtractor {
+        RegexExtractor()
     }
 }

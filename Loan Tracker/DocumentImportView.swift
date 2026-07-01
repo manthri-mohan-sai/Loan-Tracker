@@ -5,7 +5,7 @@ import UniformTypeIdentifiers
 // MARK: - Document Import View
 
 /// Entry-point sheet for scanning or importing loan documents.
-/// Orchestrates: source selection → OCR → LLM classification + extraction → review.
+/// Orchestrates: source selection → OCR → classification + extraction → review.
 struct DocumentImportView: View {
     @Environment(\.modelContext) private var context
     @Environment(\.dismiss) private var dismiss
@@ -294,30 +294,12 @@ struct DocumentImportView: View {
         }
     }
 
-    private func startPipeline() {
-        // Retry after model download — if we have OCR text, go straight to extraction
-        if !ocrText.isEmpty {
-            stage = .processing
-            Task { await runExtraction() }
-        } else {
-            stage = .choosingSource
-        }
-    }
-
     @MainActor
     private func runExtraction() async {
-        let (extractor, source) = DocumentExtractorFactory.makeExtractor()
-
-        switch source {
-        case .appleIntelligence:
-            processingStep = "Analyzing with Apple Intelligence…"
-        case .downloadedModel:
-            processingStep = "Analyzing with on-device model…"
-        case .regexFallback:
-            processingStep = "Extracting details…"
-        }
+        processingStep = "Extracting details…"
 
         do {
+            let extractor = DocumentExtractorFactory.makeExtractor()
             let result = try await extractor.classifyAndExtract(
                 ocrText: ocrText,
                 markdownText: markdownText.isEmpty ? nil : markdownText
@@ -326,22 +308,6 @@ struct DocumentImportView: View {
             extractionResult = result
             stage = .reviewing
         } catch {
-            // If CoreML or Apple Intelligence fails, fall back to regex
-            if source != .regexFallback {
-                let fallback = RegexExtractor()
-                do {
-                    processingStep = "Retrying with pattern matching…"
-                    let result = try await fallback.classifyAndExtract(
-                        ocrText: ocrText,
-                        markdownText: markdownText.isEmpty ? nil : markdownText
-                    )
-                    extractionResult = result
-                    stage = .reviewing
-                    return
-                } catch {
-                    // Regex also failed — show the error
-                }
-            }
             errorMessage = error.localizedDescription
         }
     }
